@@ -25,9 +25,9 @@
 | A region | The second region is already running. Fence the old database, promote the replica, verify a write, then register the region with the accelerator |
 | Container images | Each region has its own ECR repository holding the same tags |
 | Vault's unseal ability | The KMS key (auto-unseal). The recovery keys are in Secrets Manager |
-
 | The database instance or its availability zone | In production, Multi-AZ: RDS fails over to a standby in another zone by itself. The lab runs one instance |
 | The database's region | The cross-region read replica in Singapore, promoted to a writable database |
+| Terraform's state | **Not protected in this lab.** The state bucket is in Sydney, so with Sydney down Terraform cannot plan or apply anything, in any region. The failover below therefore has a path that uses only the AWS CLI. Production: replicate the bucket to a second region, or keep it in a third |
 
 **Data is the hard part.** Stateless pods fail over in a minute. The database decides your
 real RTO and RPO. The replica is asynchronous, so the RPO is the replication lag at the
@@ -47,94 +47,115 @@ Failover is manual and ordered on purpose. Two rules decide the order:
 - Users must never be sent to a region whose database cannot take writes.
 - Two databases must never accept writes at the same time (split brain).
 
-**This procedure has not been run.** It was written and reviewed against the code and the
-Terraform plans only. Run it as a drill before relying on it.
+### What has been tested, and what has not
 
-### Fail over to Singapore
+| Part | Status |
+| --- | --- |
+| The database steps: the fence, the restart, the final WAL position, the replica catching up, promotion | Rehearsed on two local PostgreSQL containers with `scripts/drill-local.sh`. Run it yourself: it takes a minute and needs only Docker |
+| `scripts/check-app.sh` and `scripts/db-psql.sh` | Run on a local Kubernetes cluster (kind) against the real charts and a PostgreSQL with TLS: a read, a write, a fenced database, the wrong region answering, two checks at once, a failing SQL statement |
+| Everything that is AWS: RDS parameter groups, security groups, the accelerator, Terraform's role change, Vault | **Never run.** Written and reviewed against the code and the Terraform plans only. Drill it on real infrastructure before relying on it |
 
-1. Watch the front door:
+Three scripts do the checking, so no step depends on reading a number off a screen:
+
+| Script | What it does |
+| --- | --- |
+| `scripts/check-app.sh <region> read\|write\|refused` | Asks that region's application, through the cluster. Confirms which region answered, then that a read works, a write is stored, or a write is refused |
+| `scripts/db-psql.sh <region> "<sql>"` | Runs one SQL statement against that region's database, from a short-lived pod on a backend node |
+| `scripts/handoff.sh <region>` | Writes Terraform's current outputs for Ansible |
+
+### Fail over to Singapore (planned, or Sydney is still reachable)
+
+If Sydney's AWS API or cluster does not answer, go to "If Sydney cannot be reached" below.
+
+0. **Check the standby before touching the primary.** Both must pass:
    ```
-   URL=$(terraform -chdir=stacks/30-global output -raw url)
+   scripts/check-app.sh ap-southeast-1 read
+   aws rds describe-db-instances --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1 \
+        --query 'DBInstances[0].StatusInfos[?StatusType==`read replication`].Status' --output text    # replicating
+   ```
+
+1. Watch the front door in a second terminal:
+   ```
+   URL=$(scripts/tf.sh output 30-global global | jq -r .url.value)
    while true; do curl -s -m 3 -X POST "$URL/api/visits" | jq -c .; sleep 2; done
    ```
-   The visit count rises, served by `ap-southeast-2`.
+   The visit count rises.
 
-2. **Fence Sydney's database**, in three parts. All are done on the database, outside the
-   cluster, because anything done inside the cluster can be undone: Argo CD's self-heal
-   restores a paused Application, and an autoscaler can bring back pods scaled to zero.
-
-   Part 1 makes the database itself refuse writes. This is the real fence: it applies to
-   sessions that are already connected and to any client, however it reached the database.
+2. **Fence Sydney's database.** Make it refuse writes, then restart it. Both are done on the
+   database, outside the cluster, because anything done inside the cluster can be undone:
+   Argo CD's self-heal restores a paused Application, and an autoscaler can bring back pods
+   that were scaled to zero.
    ```
    aws rds modify-db-parameter-group --region ap-southeast-2 --db-parameter-group-name lab-ap-southeast-2 \
         --parameters ParameterName=default_transaction_read_only,ParameterValue=1,ApplyMethod=immediate
    ```
-   Part 2 stops new connections, by removing the rules from the security group. It is not
-   enough alone: AWS keeps established connections open after a rule is removed.
+   Wait until the database reports the setting. Repeat until this prints `on`:
+   ```
+   scripts/db-psql.sh ap-southeast-2 "SHOW default_transaction_read_only"
+   ```
+   Only then restart, noting the database's own clock first:
+   ```
+   SET_AT=$(scripts/db-psql.sh ap-southeast-2 "SELECT now()")
+   aws rds reboot-db-instance --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   aws rds wait db-instance-available --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   ```
+   The setting makes every new transaction read-only. It does not touch a transaction that
+   was already open, which could still commit. The restart closes every session and rolls
+   back anything uncommitted. The order matters: the restart must come after the setting is
+   in force, or a session opened in between could still hold a write transaction.
+   (`scripts/drill-local.sh` shows both halves of this.)
+
+   Sydney's dev and stg environments use the same database in this lab, so they stop
+   accepting writes too.
+
+3. **Verify the fence.** All four must pass before going on:
+   ```
+   scripts/db-psql.sh ap-southeast-2 "SHOW default_transaction_read_only"                            # on
+   scripts/db-psql.sh ap-southeast-2 "SELECT pg_postmaster_start_time() > '$SET_AT'"                 # t
+   scripts/check-app.sh ap-southeast-2 refused
+   aws rds describe-db-instances --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2 \
+        --query 'DBInstances[0].DBParameterGroups[0].ParameterApplyStatus' --output text              # in-sync
+   ```
+   The second line proves the restart happened after the setting was in force, by the
+   database's own clock. The third proves
+   the application cannot write, whichever way a user reaches it: the refusal comes from
+   the database, so it also covers Sydney's own load balancer address, which stays
+   reachable from the internet whatever the accelerator does.
+
+4. **Record the primary's final position.** No client can write now, so everything that was
+   ever committed is at or before this point in the write-ahead log:
+   ```
+   FINAL_LSN=$(scripts/db-psql.sh ap-southeast-2 "SELECT pg_current_wal_lsn()")
+   echo "$FINAL_LSN"       # looks like 0/30270A8
+   ```
+
+5. **Close the door.** Remove the rules from the database's security group, so nothing can
+   connect at all. (This comes after step 4, because step 4 needs to connect.)
    ```
    SG=$(aws ec2 describe-security-groups --region ap-southeast-2 \
         --filters Name=group-name,Values=lab-ap-southeast-2-database --query 'SecurityGroups[0].GroupId' --output text)
    aws ec2 describe-security-group-rules --region ap-southeast-2 --filters Name=group-id,Values=$SG \
         --query 'SecurityGroupRules[?!IsEgress].SecurityGroupRuleId' --output text \
      | xargs -r aws ec2 revoke-security-group-ingress --region ap-southeast-2 --group-id $SG --security-group-rule-ids
-   ```
-   Part 3 ends every session that is already open. The read-only setting only decides how
-   a transaction starts, so a write transaction that was open before part 1 could still
-   commit. Restarting the instance closes every connection and rolls back anything not yet
-   committed. It comes back read-only, with no way in for new connections:
-   ```
-   aws rds reboot-db-instance --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
-   aws rds wait db-instance-available --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
-   ```
-   Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge it, so a
-   later Terraform apply keeps the fence and does not undo it.
-
-3. **Verify the fence before going on.** All four must hold:
-   ```
-   # the instance restarted after the fence was set: this time is later than step 2, part 1
-   aws rds describe-events --region ap-southeast-2 --source-type db-instance --source-identifier lab-ap-southeast-2 \
-        --duration 30 --query "Events[?contains(Message,'restarted')].Date" --output text
-   # the parameter is applied (prints "in-sync"; "applying" or "pending-reboot" means it is not)
-   aws rds describe-db-instances --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2 \
-        --query 'DBInstances[0].DBParameterGroups[0].ParameterApplyStatus' --output text
-   # no way in for new connections (prints 0)
    aws ec2 describe-security-group-rules --region ap-southeast-2 --filters Name=group-id,Values=$SG \
-        --query 'length(SecurityGroupRules[?!IsEgress])'
+        --query 'length(SecurityGroupRules[?!IsEgress])'        # 0
    ```
-   and a write sent **straight to Sydney's own load balancer**, not through the
-   accelerator, is refused. Sydney's load balancer is internet-facing, so it stays
-   reachable by its own address whatever the accelerator does:
-   ```
-   SYD=http://$(kubectl --context lab-ap-southeast-2 -n demo get ingress demo-web -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-   curl -s -X POST "$SYD/api/visits" | jq -c .      # must be the "database unavailable or read-only" error
-   ```
+   This stops new connections only; AWS can keep an established connection open after its
+   rule is removed. That is harmless here, because step 2 already made every session
+   read-only. Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge
+   it, so a later Terraform apply keeps the fence (the setting and the closed door) and does
+   not undo it.
 
-4. **If the fence cannot be applied or verified, stop. This is a decision, not a step.**
-   That is the situation in a real regional outage: Sydney's API does not answer, so you
-   cannot fence it, and you cannot know whether it is still taking writes from clients that
-   can reach it.
-
-   | Choice | What you accept |
-   | --- | --- |
-   | Wait for Sydney | A longer outage. No data is lost or split |
-   | Promote Singapore without a fence | Service returns sooner. Writes Sydney had not replicated are lost (the RPO). **And** if Sydney comes back before it is fenced, it will accept writes on its own load balancer address: two diverging databases, which cannot be merged automatically |
-
-   Promoting without a fence needs a named person's decision, recorded with the time. If
-   that is the decision, fencing Sydney (steps 2 and 3) becomes the first action the moment
-   its API answers again, before anything else is touched there, and any writes it took in
-   between have to be found and reconciled by hand. This lab has no automatic protection
-   for this case. Production designs close the gap with a managed failover that fences for
-   you (Aurora Global Database), or by keeping the standby's load balancer private.
-
-5. **Let the replica catch up, then promote it.** Nothing can be written in Sydney now, so
-   wait until Singapore has everything that was committed there: `ReplicaLag` for
-   `lab-ap-southeast-1` in CloudWatch reads 0.
+6. **Wait until the replica has everything.** It has when it has replayed past the position
+   from step 4. Repeat until this prints `t`:
    ```
-   aws cloudwatch get-metric-statistics --region ap-southeast-1 --namespace AWS/RDS --metric-name ReplicaLag \
-        --dimensions Name=DBInstanceIdentifier,Value=lab-ap-southeast-1 --statistics Maximum --period 60 \
-        --start-time "$(date -u -d '-5 min' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" --query 'Datapoints[-1].Maximum'
+   scripts/db-psql.sh ap-southeast-1 "SELECT pg_last_wal_replay_lsn() >= '$FINAL_LSN'::pg_lsn"
    ```
-   Then promote, wait, and protect it:
+   Do not use the `ReplicaLag` metric for this decision. It is a time, not a position, its
+   samples come back from CloudWatch in no particular order, and it drifts while the
+   primary is idle. Comparing positions is exact.
+
+7. **Promote Singapore's database**, wait, and protect it:
    ```
    aws rds promote-read-replica --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
    aws rds wait db-instance-available --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
@@ -144,29 +165,66 @@ Terraform plans only. Run it as a drill before relying on it.
    Deletion protection matters from this moment: this instance is now the only current copy
    of the data, and no Terraform run or mistake should be able to delete it.
 
-   With no replica left, Sydney's old database can now also be stopped, which closes it
-   completely (AWS starts a stopped instance again after seven days):
+8. **Verify a write in Singapore before any user is sent there:**
    ```
-   aws rds stop-db-instance --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   scripts/check-app.sh ap-southeast-1 write
    ```
-
-6. **Verify a write in Singapore before any user is sent there**, from inside the cluster:
-   ```
-   kubectl --context lab-ap-southeast-1 -n demo port-forward svc/demo-web 8080:80 &
-   curl -s -X POST localhost:8080/api/visits | jq -c .     # must return a count, with "store": "postgres"
-   ```
-   A page that loads is not proof. nginx answers its health check even when the database
+   A page that loads is not proof: nginx answers its health check even when the database
    refuses writes. The promoted database keeps the password it had as a replica, which the
    backend already holds, so nothing about credentials changes during the failover.
 
-7. **Move the traffic.** In `envs/global/30-global.tfvars` replace the Sydney entry with
+9. **Move the traffic.** In `envs/global/30-global.tfvars` replace the Sydney entry with
    `"ap-southeast-1" = 100`, then apply target `global`. The loop from step 1 shows counts
    again. The time from step 2 to here is your measured RTO.
 
-8. Scale the standby for full load (in the GitOps repository, raise `autoscaling.minReplicas`
-   for Singapore; Cluster Autoscaler adds nodes).
+10. Scale the standby for full load (in the GitOps repository, raise
+    `autoscaling.minReplicas` for Singapore; Cluster Autoscaler adds nodes).
 
 The failover ends here. Singapore is serving, with the credentials it already had.
+
+### If Sydney cannot be reached
+
+A real regional outage. Sydney's API does not answer, so it cannot be fenced, its final
+position cannot be read, and you cannot know whether it is still taking writes from clients
+that can reach it. **This is a decision, not a step.**
+
+| Choice | What you accept |
+| --- | --- |
+| Wait for Sydney | A longer outage. No data is lost or split |
+| Promote Singapore without a fence | Service returns sooner. Writes Sydney had not replicated are lost (the RPO). **And** if Sydney comes back before it is fenced, it will accept writes on its own load balancer address: two diverging databases, which cannot be merged automatically |
+
+Promoting without a fence needs a named person's decision, recorded with the time. This lab
+has no automatic protection for this case. Production designs close the gap with a managed
+failover that fences for you (Aurora Global Database), or by keeping the standby region's
+load balancer private.
+
+If the decision is to promote:
+
+1. Let Singapore finish applying what it has already received. Repeat until this prints `t`:
+   ```
+   scripts/db-psql.sh ap-southeast-1 "SELECT pg_last_wal_receive_lsn() = pg_last_wal_replay_lsn()"
+   ```
+2. Promote and protect it (step 7 above), then verify a write (step 8 above).
+3. Move the traffic **with the AWS CLI**. Terraform cannot be used: its state bucket is in
+   Sydney. The accelerator's own API is in `us-west-2` and still answers:
+   ```
+   ACC=$(aws globalaccelerator list-accelerators --region us-west-2 --query "Accelerators[?Name=='lab-demo'].AcceleratorArn" --output text)
+   LIS=$(aws globalaccelerator list-listeners --region us-west-2 --accelerator-arn $ACC --query 'Listeners[0].ListenerArn' --output text)
+   HOST=$(kubectl --context lab-ap-southeast-1 -n demo get ingress demo-web -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+   ALB=$(aws elbv2 describe-load-balancers --region ap-southeast-1 --query "LoadBalancers[?DNSName=='$HOST'].LoadBalancerArn" --output text)
+   aws globalaccelerator create-endpoint-group --region us-west-2 --listener-arn $LIS --endpoint-group-region ap-southeast-1 \
+        --endpoint-configurations EndpointId=$ALB,Weight=100,ClientIPPreservationEnabled=false
+   OLD=$(aws globalaccelerator list-endpoint-groups --region us-west-2 --listener-arn $LIS \
+        --query "EndpointGroups[?EndpointGroupRegion=='ap-southeast-2'].EndpointGroupArn" --output text)
+   aws globalaccelerator delete-endpoint-group --region us-west-2 --endpoint-group-arn $OLD
+   ```
+4. **The fence is now owed.** The moment Sydney's API answers again, and before anything
+   else is touched there, apply and verify it (steps 2, 3 and 5 above). Any writes Sydney
+   took in between have to be found and reconciled by hand.
+5. When Terraform can reach its state again, make it match what the CLI did: change
+   `envs/global/30-global.tfvars` as in step 9, import the new endpoint group
+   (`terraform import 'module.front_door.aws_globalaccelerator_endpoint_group.region["ap-southeast-1"]' <its ARN>`),
+   and read the plan before applying. It should have nothing left to create.
 
 ### Afterwards, in a quiet period: bring Terraform in line
 
@@ -187,46 +245,65 @@ a planned change, not part of the emergency.
    without it, Ansible would read the old secret's address and write the old password back.
    ```
    scripts/handoff.sh ap-southeast-1
-   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-1
+   (cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-1)
    ```
    Run the whole playbook, not part of it: the step that writes the password needs the
    Vault token that an earlier step loads. Every step checks before it acts.
-4. **Verify a write again**, through the front door, once External Secrets has refreshed
-   (up to a minute): the loop from the failover's step 1 must show counts rising.
+4. **Verify a write again**, once External Secrets has refreshed (up to a minute):
+   ```
+   scripts/check-app.sh ap-southeast-1 write
+   ```
 
 ### Fail back to Sydney
 
 Do not re-register Sydney or reopen its database. After the promotion Singapore is the only
 current copy. Sydney's old database is stale and is not a replica of anything.
 
-1. Leave Sydney fenced and out of the accelerator.
-2. Rebuild Sydney's database as a replica of Singapore (only after "bring Terraform in
-   line" above is done, so Singapore's stack is the primary in state): in
+1. Leave Sydney fenced and out of the accelerator. Finish "bring Terraform in line" above
+   first, so Singapore's stack is the primary in Terraform's state.
+2. **Rebuild Sydney's database as a replica of Singapore.** In
    `envs/ap-southeast-2/15-database.tfvars` set `primary_region = "ap-southeast-1"` and
-   `fenced = false`, then apply. The plan **replaces** Sydney's instance (a primary cannot
-   be turned into a replica), which is intended here: the stale copy is the one being
-   discarded. Check that the plan touches Sydney's stack only.
-3. Wait for the replica to catch up (`ReplicaLag` in CloudWatch near zero).
+   `fenced = false`, then apply Sydney's database stack. The plan **replaces** Sydney's
+   instance (a primary cannot be turned into a replica), which is intended here: the stale
+   copy is the one being discarded. Check that the plan touches Sydney's stack only.
+   While Sydney's database is a replica, the dev and stg environments that share it in this
+   lab can read but not write.
+3. Wait until it is a working replica:
+   ```
+   aws rds describe-db-instances --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2 \
+        --query 'DBInstances[0].StatusInfos[?StatusType==`read replication`].Status' --output text    # replicating
+   ```
 4. **Give Sydney's backend the current credentials.** The rebuilt replica has Singapore's
    password, not the one Sydney's Vault still holds from before the failover:
    ```
    scripts/handoff.sh ap-southeast-2
-   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-2
+   (cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-2)
    ```
 5. **Verify Sydney can read its database before touching Singapore.** If this fails, the
    reverse cutover would get stuck half way, with Singapore fenced and Sydney unable to serve:
    ```
-   kubectl --context lab-ap-southeast-2 -n demo port-forward svc/demo-web 8080:80 &
-   curl -s localhost:8080/api/visits | jq -c .     # must return the current count, with "store": "postgres"
+   scripts/check-app.sh ap-southeast-2 read
    ```
-6. Run the failover steps in the other direction, in a quiet period: fence Singapore, verify,
-   let Sydney catch up, promote Sydney, verify a write, move the traffic. Then bring
-   Terraform in line.
-7. Rebuild Singapore as the replica, then give its backend the credentials the same way
-   (steps 4 and 5, for `ap-southeast-1`).
 
-Many teams do not fail back at all: the region that took over stays primary, and the other
-becomes the new standby (steps 1 to 5 only).
+Many teams stop here: the region that took over stays primary, and the other is the new
+standby. To move the primary back to Sydney, continue, in a quiet period:
+
+6. Run "Fail over" above in the other direction (swap the two region names in every
+   command): fence Singapore, verify, record its final position, close the door, wait for
+   Sydney to replay past it, promote Sydney, verify a write in Sydney, move the traffic.
+7. Bring Terraform in line for Sydney ("Afterwards" above, with the region names swapped).
+8. **Rebuild Singapore as the replica, in two separate applies.** Singapore's instance has
+   deletion protection on, and RDS refuses to delete a protected instance, so Terraform
+   cannot replace it in one go:
+
+   - First apply: in `envs/ap-southeast-1/15-database.tfvars` set only
+     `deletion_protection = false`. The plan is an update in place. Do this only after
+     step 6's write check has passed in Sydney: from here Singapore's copy can be deleted.
+   - Second apply: set `primary_region = "ap-southeast-2"` and `fenced = false`. The plan
+     replaces Singapore's instance with a replica of Sydney.
+
+9. Give Singapore's backend the credentials and check it, as in steps 4 and 5, for
+   `ap-southeast-1`.
 
 ## Drill 2: restore a deleted namespace with Velero
 
@@ -246,5 +323,5 @@ matters most for what Git does not hold, such as persistent volumes and objects 
 ## Drill 3: rebuild a cluster from nothing
 
 Destroy the standby region with the deploy workflow, then apply it again. Nothing is done by
-hand: about 25 minutes later it serves the application at the version Git says. That is the
+hand: about 45 minutes later it serves the application at the version Git says. That is the
 strongest disaster recovery claim an infrastructure-as-code platform can make.

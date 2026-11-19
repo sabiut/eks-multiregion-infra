@@ -181,6 +181,16 @@ Everything that is not AWS-specific works there: Argo CD, the app of apps, Vault
 Secrets, canary and blue-green releases, the autoscaler for pods, pod security, RBAC, and
 the NetworkPolicy between frontend and backend.
 
+## Scripts
+
+| Script | What it does |
+| --- | --- |
+| `scripts/tf.sh` | Runs one Terraform stack in one region, the same on a laptop and in the pipeline |
+| `scripts/handoff.sh` | Writes Terraform's current outputs for Ansible |
+| `scripts/check-app.sh` | Asks one region's application for a read or a write, and confirms which region answered |
+| `scripts/db-psql.sh` | Runs one SQL statement against a region's database, from a short-lived pod |
+| `scripts/drill-local.sh` | Rehearses the database part of the failover on two local PostgreSQL containers. No AWS, about a minute |
+
 ## Runbooks
 
 - [Upgrading Kubernetes](docs/upgrade-runbook.md)

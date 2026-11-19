@@ -20,10 +20,10 @@ resource "aws_security_group" "this" {
   tags = { Name = "${var.name}-database" }
 }
 
-# THE WRITE FENCE, part 2 of 2: with fenced = true there is no rule at all, so no NEW
+# THE WRITE FENCE, second half: with fenced = true there is no rule at all, so no NEW
 # connection can be made. This alone is not a fence: AWS keeps already-established
-# connections open after a rule is removed (connection tracking). Part 1, the parameter
-# group below, is what stops writes on connections that are already open.
+# connections open after a rule is removed (connection tracking). The first half, the
+# parameter group below, is what makes the database refuse writes.
 resource "aws_vpc_security_group_ingress_rule" "from_backend" {
   for_each = var.fenced ? toset([]) : toset(var.allowed_cidrs)
 
@@ -68,7 +68,7 @@ resource "aws_secretsmanager_secret_version" "master" {
   secret_string_wo_version = var.password_version
 }
 
-# THE WRITE FENCE, part 1 of 2: with fenced = true the database itself refuses writes.
+# THE WRITE FENCE, first half: with fenced = true the database itself refuses writes.
 # default_transaction_read_only makes every transaction read-only, including on sessions
 # that are already connected, and however the client reached the database. Replication to
 # the other region is not a client transaction and carries on, so the replica can still
