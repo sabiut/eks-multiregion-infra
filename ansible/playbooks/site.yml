@@ -1,0 +1,4 @@
+# Everything Ansible does to a new cluster, in order.
+#   ansible-playbook playbooks/site.yml --limit ap-southeast-2
+- import_playbook: bootstrap.yml
+- import_playbook: vault.yml

@@ -1,0 +1,23 @@
+# Variables for a local kind cluster (no AWS, no cost):  kind create cluster --name mr-local
+cluster_name: mr-local
+kube_context: kind-mr-local
+cluster_dir: local
+
+cluster_values:
+  name: mr-local
+  region: local
+  accountId: ""
+  registry: ""
+  vpcCidr: 10.244.0.0/16
+  karpenterQueue: ""
+  karpenterNodeRole: ""
+  veleroBucket: ""
+  vaultKmsAlias: ""
+
+# Kept in a file ignored by Git.
+vault_init_store: file
+vault_init_file: "{{ playbook_dir }}/../.local/vault-init.json"
+
+# No database on kind: the backend counts visits in memory.
+database:
+  host: ""

@@ -1,0 +1,103 @@
+# Words used below:
+#   initialise  create Vault's encryption keys. Done once in the life of a Vault.
+#   sealed      Vault is running but its data is still encrypted; it answers nothing.
+#   unseal      give Vault its key so it can decrypt its data. Needed after every restart,
+#               unless auto-unseal (a cloud KMS key) does it.
+#   shamir      the default seal: the key is split into shares held by people.
+#   awskms      auto-unseal with AWS KMS. Init then prints recovery keys, not unseal keys.
+
+- name: Wait for the Vault pod to be running
+  kubernetes.core.k8s_info:
+    context: "{{ kube_context }}"
+    kind: Pod
+    namespace: "{{ vault_namespace }}"
+    name: "{{ vault_pod }}"
+  register: vault_pod_info
+  until:
+    - vault_pod_info.resources | length > 0
+    - vault_pod_info.resources[0].status.phase == 'Running'
+  retries: 90
+  delay: 10
+
+- name: Read Vault's status
+  ansible.builtin.command:
+    argv: "{{ vault_exec + ['vault', 'status', '-format=json'] }}"
+  register: vault_status_cmd
+  changed_when: false
+  # Exit code 2 means "sealed", which is expected on a new Vault.
+  failed_when: vault_status_cmd.rc not in [0, 2]
+  until: vault_status_cmd.rc in [0, 2]
+  retries: 12
+  delay: 5
+
+- name: Remember the status
+  ansible.builtin.set_fact:
+    vault_status: "{{ vault_status_cmd.stdout | from_json }}"
+
+- name: Initialise Vault (first run only)
+  ansible.builtin.command:
+    argv: "{{ vault_exec + ['vault', 'operator', 'init', '-format=json'] + vault_init_flags }}"
+  vars:
+    vault_init_flags: "{{ ['-key-shares=1', '-key-threshold=1'] if vault_status.type == 'shamir' else ['-recovery-shares=1', '-recovery-threshold=1'] }}"
+  register: vault_init_cmd
+  no_log: true
+  when: not vault_status.initialized
+
+# The init output is shown once and never again. Lose it and the Vault cannot be recovered.
+- name: Save the init output in AWS Secrets Manager
+  when:
+    - vault_init_cmd is changed
+    - vault_init_store == 'secretsmanager'
+  block:
+    - name: Create the secret
+      ansible.builtin.command:
+        argv: [aws, secretsmanager, create-secret, --region, "{{ region }}", --name, "{{ vault_init_secret }}", --secret-string, "file:///dev/stdin"]
+        stdin: "{{ vault_init_cmd.stdout }}"
+      no_log: true
+  rescue:
+    - name: The secret already exists, so add a new version
+      ansible.builtin.command:
+        argv: [aws, secretsmanager, put-secret-value, --region, "{{ region }}", --secret-id, "{{ vault_init_secret }}", --secret-string, "file:///dev/stdin"]
+        stdin: "{{ vault_init_cmd.stdout }}"
+      no_log: true
+
+- name: Save the init output in a local file (kind only)
+  ansible.builtin.copy:
+    content: "{{ vault_init_cmd.stdout }}"
+    dest: "{{ vault_init_file }}"
+    mode: "0600"
+  no_log: true
+  when:
+    - vault_init_cmd is changed
+    - vault_init_store == 'file'
+
+- name: Read the init output from AWS Secrets Manager
+  ansible.builtin.command:
+    argv: [aws, secretsmanager, get-secret-value, --region, "{{ region }}", --secret-id, "{{ vault_init_secret }}", --query, SecretString, --output, text]
+  register: vault_init_read
+  changed_when: false
+  no_log: true
+  when: vault_init_store == 'secretsmanager'
+
+- name: Keep the keys and root token for the next tasks
+  ansible.builtin.set_fact:
+    vault_init: "{{ (vault_init_read.stdout if vault_init_store == 'secretsmanager' else lookup('ansible.builtin.file', vault_init_file)) | from_json }}"
+  no_log: true
+
+- name: Unseal Vault (shamir seal only; with awskms Vault unseals itself)
+  ansible.builtin.command:
+    argv: "{{ vault_exec + ['vault', 'operator', 'unseal', vault_init.unseal_keys_b64[0]] }}"
+  no_log: true
+  when:
+    - vault_status.type == 'shamir'
+    - vault_status.sealed or vault_init_cmd is changed
+
+- name: Wait until Vault is unsealed
+  ansible.builtin.command:
+    argv: "{{ vault_exec + ['vault', 'status', '-format=json'] }}"
+  register: vault_unsealed
+  changed_when: false
+  failed_when: false
+  until: vault_unsealed.rc == 0
+  retries: 12
+  delay: 5

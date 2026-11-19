@@ -1,0 +1,224 @@
+# Build, change or remove one region, or the global front door. Started by hand:
+# Actions > deploy > Run workflow.
+#
+#   target   ap-southeast-2 (Sydney, primary), ap-southeast-1 (Singapore, standby) or global
+#   action   plan     show what would change (read-only role)
+#            apply    Terraform builds the AWS side, then Ansible configures the cluster
+#            destroy  Ansible drains the cluster, then Terraform removes the AWS side
+#
+# Order for a full build:   ap-southeast-2 apply, ap-southeast-1 apply, global apply
+# Order for a full removal: global destroy, then each region destroy
+#
+# apply and destroy run in the "production" environment, which waits for a reviewer, and only
+# that environment may use the apply role (see bootstrap/github.tf).
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Region, or "global" for the Global Accelerator
+        type: choice
+        options: [ap-southeast-2, ap-southeast-1, global]
+        required: true
+      action:
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+        required: true
+      confirm_destroy:
+        description: To destroy, type the target name again
+        type: string
+        required: false
+
+permissions:
+  id-token: write
+  contents: read
+
+# One run per target at a time: two Terraform runs on the same state would fight over the lock.
+concurrency:
+  group: deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_CLI_ARGS: "-no-color"
+  TERRAFORM_VERSION: 1.17.2
+  TARGET: ${{ inputs.target }}
+  TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+  CLUSTER_ADMIN_ARN: ${{ secrets.CLUSTER_ADMIN_ARN }}
+  GITOPS_REPO_URL: ${{ vars.GITOPS_REPO_URL }}
+
+jobs:
+  plan:
+    if: inputs.action == 'plan'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ inputs.target == 'global' && 'us-west-2' || inputs.target }}
+      - name: Plan
+        run: |
+          if [ "$TARGET" = global ]; then
+            scripts/tf.sh plan 30-global global
+          else
+            scripts/tf.sh plan 10-network "$TARGET"
+            if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$TARGET/10-network.tfstate" >/dev/null 2>&1; then
+              scripts/tf.sh plan 15-database "$TARGET"
+            else
+              echo "Skipped 15-database and 20-eks: apply the network first."
+            fi
+            if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$TARGET/15-database.tfstate" >/dev/null 2>&1; then
+              scripts/tf.sh plan 20-eks "$TARGET"
+            fi
+          fi
+
+  apply:
+    if: inputs.action == 'apply'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ inputs.target == 'global' && 'us-west-2' || inputs.target }}
+          role-duration-seconds: 7200
+
+      # ---- global: the front door, after both regions serve the application ----
+      - name: Terraform, Global Accelerator
+        if: inputs.target == 'global'
+        run: |
+          scripts/tf.sh apply 30-global global
+          echo "### Front door" >> "$GITHUB_STEP_SUMMARY"
+          terraform -chdir=stacks/30-global output -raw url >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- a region: Terraform first, then Ansible ----
+      - name: Terraform, network
+        if: inputs.target != 'global'
+        run: scripts/tf.sh apply 10-network "$TARGET"
+
+      # Sydney holds the primary. Singapore's is a replica of it, so Sydney must exist first.
+      - name: Terraform, database
+        if: inputs.target != 'global'
+        run: scripts/tf.sh apply 15-database "$TARGET"
+
+      - name: Terraform, EKS cluster
+        if: inputs.target != 'global'
+        run: scripts/tf.sh apply 20-eks "$TARGET"
+
+      # The handoff: Terraform's outputs become Ansible's variables.
+      - name: Hand Terraform outputs to Ansible
+        if: inputs.target != 'global'
+        run: |
+          mkdir -p ansible/.tfout
+          scripts/tf.sh output 20-eks "$TARGET" > "ansible/.tfout/$TARGET.json"
+
+      - uses: actions/setup-python@v5
+        if: inputs.target != 'global'
+        with:
+          python-version: "3.12"
+
+      - name: Install Ansible
+        if: inputs.target != 'global'
+        working-directory: ansible
+        run: |
+          pip install --quiet ansible-core -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+
+      - name: Ansible, install Argo CD and point it at the GitOps repository
+        if: inputs.target != 'global'
+        working-directory: ansible
+        run: ansible-playbook playbooks/bootstrap.yml --limit "$TARGET"
+
+      - name: Ansible, initialise and configure Vault
+        if: inputs.target != 'global'
+        working-directory: ansible
+        run: ansible-playbook playbooks/vault.yml --limit "$TARGET"
+
+      - name: Summary
+        if: inputs.target != 'global'
+        run: |
+          {
+            echo "### $TARGET is up"
+            echo "Argo CD is now installing the add-ons and the application from the GitOps repository."
+            echo '```'
+            kubectl --context "lab-$TARGET" -n argocd get applications
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  destroy:
+    if: inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check the confirmation
+        run: |
+          [ "${{ inputs.confirm_destroy }}" = "$TARGET" ] || { echo "Type \"$TARGET\" in confirm_destroy to destroy it."; exit 1; }
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ inputs.target == 'global' && 'us-west-2' || inputs.target }}
+          role-duration-seconds: 7200
+
+      - name: Terraform, remove the Global Accelerator
+        if: inputs.target == 'global'
+        run: scripts/tf.sh destroy 30-global global
+
+      # A region cannot go while the Global Accelerator still points at its load balancer.
+      - name: Check the front door is gone
+        if: inputs.target != 'global'
+        run: |
+          n=$(aws globalaccelerator list-accelerators --region us-west-2 --query "length(Accelerators[?Name=='lab-demo'])" --output text)
+          [ "$n" = 0 ] || { echo "Destroy the target \"global\" first."; exit 1; }
+
+      - name: Hand Terraform outputs to Ansible
+        if: inputs.target != 'global'
+        id: outputs
+        run: |
+          mkdir -p ansible/.tfout
+          scripts/tf.sh output 20-eks "$TARGET" > "ansible/.tfout/$TARGET.json"
+          if jq -e .cluster_name "ansible/.tfout/$TARGET.json" >/dev/null; then echo "cluster=yes" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-python@v5
+        if: steps.outputs.outputs.cluster == 'yes'
+        with:
+          python-version: "3.12"
+
+      # Controllers in the cluster created a load balancer, EC2 instances and a volume.
+      # They must remove them before the cluster goes, or they are left behind.
+      - name: Ansible, drain the cluster
+        if: steps.outputs.outputs.cluster == 'yes'
+        working-directory: ansible
+        run: |
+          pip install --quiet ansible-core -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+          ansible-playbook playbooks/drain.yml --limit "$TARGET"
+
+      - name: Terraform, remove the EKS cluster
+        if: inputs.target != 'global'
+        run: scripts/tf.sh destroy 20-eks "$TARGET"
+
+      # Destroy a replica region before the region that holds its primary.
+      - name: Terraform, remove the database
+        if: inputs.target != 'global'
+        run: scripts/tf.sh destroy 15-database "$TARGET"
+
+      - name: Terraform, remove the network
+        if: inputs.target != 'global'
+        run: scripts/tf.sh destroy 10-network "$TARGET"

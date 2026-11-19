@@ -1,0 +1,13 @@
+# The one Application created by hand (by this playbook). It renders the platform-apps chart
+# from the GitOps repository, which produces every other Application: the "app of apps" pattern.
+- name: Create or update the root Application
+  kubernetes.core.k8s:
+    context: "{{ kube_context }}"
+    state: present
+    definition: "{{ lookup('ansible.builtin.template', 'root-application.yaml.j2') | from_yaml }}"
+
+- name: Show how to watch the rollout
+  ansible.builtin.debug:
+    msg:
+      - "Argo CD now reads {{ gitops_repo_url }} (clusters/{{ cluster_dir }})."
+      - "Watch: kubectl --context {{ kube_context }} -n argocd get applications -w"

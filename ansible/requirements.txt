@@ -1,0 +1,3 @@
+# Python libraries the kubernetes.core modules need: pip install -r requirements.txt
+kubernetes>=31
+PyYAML>=6

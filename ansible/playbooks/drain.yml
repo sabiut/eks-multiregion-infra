@@ -1,0 +1,90 @@
+# Run before `terraform destroy` on a region.
+#
+# Some AWS resources are created by controllers inside the cluster, not by Terraform:
+#   the load balancer   by the AWS Load Balancer Controller, from the Ingress
+#   EC2 instances       by Karpenter, from the NodePool
+#   an EBS volume       by the EBS CSI driver, from Vault's PersistentVolumeClaim
+# Terraform does not know about them. If the cluster is destroyed first, nothing is left to
+# delete them: they keep costing money and the VPC cannot be deleted. So ask the controllers
+# to remove them while the cluster still exists.
+#
+#   ansible-playbook playbooks/drain.yml --limit ap-southeast-2
+- name: Remove what the cluster created in AWS
+  hosts: aws
+  gather_facts: false
+  vars:
+    k: [kubectl, --context, "{{ kube_context }}"]
+
+  tasks:
+    - name: Refuse to run against every cluster by accident
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Choose a cluster: --limit ap-southeast-2 or --limit ap-southeast-1"
+      run_once: true
+
+    - name: Is the cluster there?
+      ansible.builtin.command:
+        argv: [aws, eks, describe-cluster, --region, "{{ region }}", --name, "{{ cluster_name }}", --query, cluster.status, --output, text]
+      register: cluster_status
+      changed_when: false
+      failed_when: false
+
+    - name: Nothing to drain
+      ansible.builtin.meta: end_host
+      when: cluster_status.rc != 0
+
+    - name: Write a kubeconfig entry
+      ansible.builtin.command:
+        argv: [aws, eks, update-kubeconfig, --region, "{{ region }}", --name, "{{ cluster_name }}", --alias, "{{ kube_context }}"]
+      changed_when: false
+
+    - name: Stop Argo CD putting things back (root first, then the Applications it made)
+      ansible.builtin.command:
+        argv: "{{ k + ['-n', 'argocd', 'patch', 'application', item, '--type', 'merge', '-p', '{\"spec\":{\"syncPolicy\":null}}'] }}"
+      loop: [root, platform-config, vault]
+      failed_when: false
+
+    - name: Delete the application in every environment (the Ingress goes, so the controller deletes the load balancer)
+      ansible.builtin.command:
+        argv: "{{ k + ['-n', 'argocd', 'delete', 'applications', '-l', 'environment', '--ignore-not-found', '--wait=true', '--timeout=5m'] }}"
+      failed_when: false
+
+    - name: Delete Karpenter NodePools (Karpenter drains and terminates the nodes it launched)
+      ansible.builtin.command:
+        argv: "{{ k + ['delete', 'nodepools.karpenter.sh', '--all', '--ignore-not-found', '--wait=true', '--timeout=10m'] }}"
+      failed_when: false
+
+    - name: Delete Vault and its volume claim (the EBS CSI driver deletes the volume)
+      ansible.builtin.command:
+        argv: "{{ k + item }}"
+      loop:
+        - ['-n', 'argocd', 'delete', 'application', 'vault', '--ignore-not-found', '--wait=true', '--timeout=5m']
+        - ['-n', 'vault', 'delete', 'pvc', '--all', '--ignore-not-found', '--wait=true', '--timeout=5m']
+      failed_when: false
+
+    - name: Wait until AWS shows no load balancer for this cluster
+      ansible.builtin.command:
+        argv: [aws, resourcegroupstaggingapi, get-resources, --region, "{{ region }}", --resource-type-filters, "elasticloadbalancing:loadbalancer", --tag-filters, "Key=elbv2.k8s.aws/cluster,Values={{ cluster_name }}", --query, "length(ResourceTagMappingList)", --output, text]
+      register: lbs
+      changed_when: false
+      until: lbs.stdout == '0'
+      retries: 60
+      delay: 10
+
+    - name: Wait until AWS shows no Karpenter instance for this cluster
+      ansible.builtin.command:
+        argv: [aws, ec2, describe-instances, --region, "{{ region }}", --filters, "Name=tag:eks:eks-cluster-name,Values={{ cluster_name }}", "Name=tag-key,Values=karpenter.sh/nodepool", "Name=instance-state-name,Values=pending,running,stopping,shutting-down", --query, "length(Reservations[].Instances[])", --output, text]
+      register: instances
+      changed_when: false
+      until: instances.stdout == '0'
+      retries: 60
+      delay: 10
+
+    - name: Delete the saved Vault init output (the Vault it belongs to is gone)
+      ansible.builtin.command:
+        argv: [aws, secretsmanager, delete-secret, --region, "{{ region }}", --secret-id, "{{ vault_init_secret }}", --force-delete-without-recovery]
+      failed_when: false
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: "{{ cluster_name }} is drained. Terraform can now destroy 20-eks, then 15-database, then 10-network."

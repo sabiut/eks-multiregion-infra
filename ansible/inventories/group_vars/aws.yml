@@ -1,0 +1,34 @@
+# Variables for the EKS clusters. Everything cluster-specific comes from Terraform's outputs:
+# the pipeline runs `scripts/tf.sh output 20-eks <region> > ansible/.tfout/<region>.json`
+# after the apply, and this file reads it. That JSON file is the handoff between the tools.
+tf: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../.tfout/' ~ region ~ '.json') | from_json }}"
+
+cluster_name: "{{ tf.cluster_name.value }}"
+kube_context: "{{ tf.cluster_name.value }}"
+cluster_dir: "{{ region }}" # clusters/<cluster_dir>/ in the GitOps repository
+
+# Passed to Argo CD as Helm values (see roles/root_app). The GitOps repository uses them where
+# a value differs per cluster and should not be committed, such as the account ID.
+cluster_values:
+  name: "{{ tf.cluster_name.value }}"
+  region: "{{ region }}"
+  accountId: "{{ tf.account_id.value }}"
+  registry: "{{ tf.account_id.value }}.dkr.ecr.{{ region }}.amazonaws.com"
+  vpcCidr: "{{ tf.vpc_cidr.value }}"
+  karpenterQueue: "{{ tf.karpenter_queue.value }}"
+  karpenterNodeRole: "{{ tf.karpenter_node_role.value }}"
+  veleroBucket: "{{ tf.velero_bucket.value }}"
+  vaultKmsAlias: "{{ tf.vault_kms_alias.value }}"
+
+# The database tier, from Terraform. Ansible reads the credentials from Secrets Manager and
+# writes them into Vault (roles/vault_config). Empty host = no database, nothing to write.
+database:
+  host: "{{ tf.db_host.value }}"
+  port: "{{ tf.db_port.value }}"
+  name: "{{ tf.db_name.value }}"
+  secret_arn: "{{ tf.db_secret_arn.value }}"
+  secret_region: "{{ tf.db_secret_region.value }}"
+
+# Where the Vault init output (recovery keys, first root token) is kept.
+vault_init_store: secretsmanager
+vault_init_secret: "{{ tf.cluster_name.value }}/vault-init"

@@ -1,0 +1,22 @@
+# The inventory lists what Ansible manages. Usually that is servers reached over SSH. Here
+# each "host" is a Kubernetes cluster, and every task runs on the machine running Ansible
+# (connection: local) and talks to the cluster's API.
+#
+# The EKS hosts are named after their region, so the pipeline can pass the region straight
+# to --limit.
+#
+#   ansible-playbook playbooks/site.yml --limit ap-southeast-2
+all:
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  children:
+    aws:
+      hosts:
+        ap-southeast-2: {} # Sydney, primary, Karpenter
+        ap-southeast-1: {} # Singapore, standby, Cluster Autoscaler
+      vars:
+        region: "{{ inventory_hostname }}"
+    kind:
+      hosts:
+        local: {}

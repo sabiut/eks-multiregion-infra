@@ -1,0 +1,1 @@
+vault_exec_stdin: [kubectl, --context, "{{ kube_context }}", -n, "{{ vault_namespace }}", exec, -i, "{{ vault_pod }}", -c, vault, --, sh, -s]

@@ -1,0 +1,22 @@
+# Terraform: state and plans can hold secrets and account details. Never commit them.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+backend_override.tf
+.planonly/
+# Only the committed example is tracked; real bootstrap values stay local.
+bootstrap/terraform.tfvars
+
+# Ansible: Terraform outputs handed to Ansible, kubeconfigs, Vault init output
+ansible/.tfout/
+ansible/.local/
+*.retry
+kubeconfig*
+.vault-init*.json
+
+.env
+*.pem
+*.html

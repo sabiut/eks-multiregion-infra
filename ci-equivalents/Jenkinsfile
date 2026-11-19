@@ -1,0 +1,76 @@
+// The deploy workflow (.github/workflows/deploy.yml) written for Jenkins.
+// Reference only: this repository runs on GitHub Actions, and this file has not been run.
+//
+// The shape is the same in any CI tool: plan, a person approves, Terraform applies,
+// Terraform's outputs are handed to Ansible, Ansible configures the cluster.
+pipeline {
+  agent { label 'terraform' }
+
+  parameters {
+    choice(name: 'TARGET', choices: ['ap-southeast-2', 'ap-southeast-1'], description: 'Region')
+    choice(name: 'ACTION', choices: ['plan', 'apply'], description: 'What to do')
+  }
+
+  options {
+    timestamps()
+    // Two runs on the same Terraform state would fight over the lock.
+    lock(resource: "terraform-${params.TARGET}")
+  }
+
+  environment {
+    TF_IN_AUTOMATION = '1'
+    CI               = 'true'
+  }
+
+  stages {
+    stage('Checks') {
+      steps {
+        sh 'terraform fmt -check -recursive'
+        sh 'cd ansible && for p in playbooks/*.yml; do ansible-playbook "$p" --syntax-check; done'
+      }
+    }
+
+    stage('Plan') {
+      steps {
+        withAWS(role: 'eks-multiregion-plan', region: params.TARGET) {
+          sh 'scripts/tf.sh plan 10-network "$TARGET"'
+          sh 'scripts/tf.sh plan 15-database "$TARGET"'
+          sh 'scripts/tf.sh plan 20-eks "$TARGET"'
+        }
+      }
+    }
+
+    stage('Approve') {
+      when { expression { params.ACTION == 'apply' } }
+      steps { input message: "Apply to ${params.TARGET}?", ok: 'Apply', submitter: 'platform-team' }
+    }
+
+    stage('Terraform apply') {
+      when { expression { params.ACTION == 'apply' } }
+      steps {
+        withAWS(role: 'eks-multiregion-apply', region: params.TARGET) {
+          sh 'scripts/tf.sh apply 10-network "$TARGET"'
+          sh 'scripts/tf.sh apply 15-database "$TARGET"'
+          sh 'scripts/tf.sh apply 20-eks "$TARGET"'
+          sh 'mkdir -p ansible/.tfout && scripts/tf.sh output 20-eks "$TARGET" > "ansible/.tfout/$TARGET.json"'
+        }
+      }
+    }
+
+    stage('Ansible configure') {
+      when { expression { params.ACTION == 'apply' } }
+      steps {
+        withAWS(role: 'eks-multiregion-apply', region: params.TARGET) {
+          dir('ansible') {
+            sh 'ansible-galaxy collection install -r requirements.yml'
+            sh 'ansible-playbook playbooks/site.yml --limit "$TARGET"'
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always { cleanWs() }
+  }
+}

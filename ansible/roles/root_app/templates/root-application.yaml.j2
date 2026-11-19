@@ -1,0 +1,29 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: {{ gitops_repo_url }}
+    targetRevision: {{ gitops_repo_revision }}
+    path: charts/platform-apps
+    helm:
+      releaseName: root
+      # What is installed on this cluster, and which versions: reviewed in Git.
+      valueFiles:
+        - ../../clusters/{{ cluster_dir }}/platform.yaml
+      # Facts about this cluster that come from Terraform, not from Git.
+      valuesObject:
+        repoURL: {{ gitops_repo_url }}
+        revision: {{ gitops_repo_revision }}
+        clusterDir: {{ cluster_dir }}
+        cluster: {{ cluster_values | to_json }}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

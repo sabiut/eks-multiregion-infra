@@ -1,0 +1,24 @@
+# Make Vault usable, then configure it for the demo application.
+#
+# Argo CD installs the Vault pod, but a new Vault is "uninitialised": it has no encryption
+# keys yet and cannot store anything. Someone must initialise it exactly once, keep the keys
+# it prints, and then set up who may read which secret. That is configuration, so it lives
+# here rather than in Terraform or Helm.
+#
+#   ansible-playbook playbooks/vault.yml --limit ap-southeast-2
+- name: Initialise and configure Vault
+  hosts: all
+  gather_facts: false
+
+  pre_tasks:
+    - name: Refuse to run against every cluster by accident
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Choose a cluster: --limit ap-southeast-2, --limit ap-southeast-1 or --limit local"
+      run_once: true
+
+  roles:
+    - role: vault_init
+      tags: [init]
+    - role: vault_config
+      tags: [config]

@@ -1,0 +1,2 @@
+# Run a command inside the Vault pod. The pod already has VAULT_ADDR set.
+vault_exec: [kubectl, --context, "{{ kube_context }}", -n, "{{ vault_namespace }}", exec, "{{ vault_pod }}", -c, vault, --]

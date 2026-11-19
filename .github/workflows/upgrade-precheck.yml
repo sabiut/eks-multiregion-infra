@@ -1,0 +1,48 @@
+# Read-only readiness report before a Kubernetes version upgrade. Changes nothing.
+# The upgrade itself is a pull request that raises kubernetes_version (docs/upgrade-runbook.md).
+name: upgrade-precheck
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        type: choice
+        options: [ap-southeast-1, ap-southeast-2]
+        required: true
+      target_version:
+        description: Kubernetes version to move to, such as 1.37
+        type: string
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  precheck:
+    runs-on: ubuntu-latest
+    # Uses the apply role because reading inside the cluster needs a cluster access entry.
+    environment: production
+    env:
+      TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_APPLY_ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Report
+        run: |
+          mkdir -p ansible/.tfout
+          scripts/tf.sh output 20-eks "${{ inputs.region }}" > "ansible/.tfout/${{ inputs.region }}.json"
+          cd ansible
+          pip install --quiet ansible-core -r requirements.txt
+          ansible-galaxy collection install -r requirements.yml
+          ansible-playbook playbooks/upgrade-precheck.yml --limit "${{ inputs.region }}" -e "target_version=${{ inputs.target_version }}"

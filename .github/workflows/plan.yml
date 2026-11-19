@@ -1,0 +1,81 @@
+# Every pull request: check formatting and syntax, then show what Terraform would change.
+# Uses the read-only plan role, so a pull request can never change AWS.
+name: plan
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write # lets the job ask GitHub for an OIDC token to sign in to AWS
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "1"
+  TF_CLI_ARGS: "-no-color"
+  TERRAFORM_VERSION: 1.17.2
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      - name: Terraform format
+        run: terraform fmt -check -recursive
+      - name: Terraform validate
+        run: |
+          for d in bootstrap stacks/*; do
+            echo "== $d"
+            terraform -chdir="$d" init -backend=false -input=false >/dev/null
+            terraform -chdir="$d" validate
+          done
+      - name: Security scan of the Terraform (misconfigurations)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          severity: CRITICAL,HIGH
+          exit-code: "0" # report only; change to 1 to block the pull request
+      - name: Ansible syntax
+        working-directory: ansible
+        run: |
+          pipx install ansible-core
+          ansible-galaxy collection install -r requirements.yml
+          for p in playbooks/*.yml; do ansible-playbook "$p" --syntax-check; done
+
+  plan:
+    needs: checks
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        region: [ap-southeast-2, ap-southeast-1]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ matrix.region }}
+      - name: Plan
+        env:
+          TF_STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+          CLUSTER_ADMIN_ARN: ${{ secrets.CLUSTER_ADMIN_ARN }}
+        run: |
+          scripts/tf.sh plan 10-network ${{ matrix.region }} | tee plan.txt
+          # The other stacks read the state of the one before, so each can be planned only
+          # once that exists.
+          if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "${{ matrix.region }}/10-network.tfstate" >/dev/null 2>&1; then
+            scripts/tf.sh plan 15-database ${{ matrix.region }} | tee -a plan.txt
+          else
+            echo "Skipped 15-database and 20-eks: the network in ${{ matrix.region }} has not been applied yet." | tee -a plan.txt
+          fi
+          if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "${{ matrix.region }}/15-database.tfstate" >/dev/null 2>&1; then
+            scripts/tf.sh plan 20-eks ${{ matrix.region }} | tee -a plan.txt
+          fi
+          { echo "### ${{ matrix.region }}"; echo '```'; grep -E '^(Plan:|No changes|Skipped)' plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

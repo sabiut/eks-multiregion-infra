@@ -1,0 +1,30 @@
+# Turn an empty cluster into one that manages itself from Git.
+#
+# Terraform built the AWS side. This playbook does the one-time configuration inside the
+# cluster: install Argo CD, then give it a single "root" Application pointing at the apps
+# repository. After that, Argo CD installs everything else and keeps it in sync.
+#
+# Safe to run again at any time: every task describes the end state, so a second run changes
+# nothing (this is what "idempotent" means).
+- name: Bootstrap GitOps on a cluster
+  hosts: all
+  gather_facts: false
+
+  pre_tasks:
+    - name: Refuse to run against every cluster by accident
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Choose a cluster: --limit ap-southeast-2, --limit ap-southeast-1 or --limit local"
+      run_once: true
+
+    - name: Write a kubeconfig entry for the EKS cluster
+      ansible.builtin.command:
+        argv: [aws, eks, update-kubeconfig, --region, "{{ region }}", --name, "{{ cluster_name }}", --alias, "{{ kube_context }}"]
+      changed_when: false
+      when: "'aws' in group_names"
+
+  roles:
+    - role: argocd
+      tags: [argocd]
+    - role: root_app
+      tags: [root_app]

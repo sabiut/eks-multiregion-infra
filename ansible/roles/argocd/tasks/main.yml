@@ -1,0 +1,28 @@
+- name: Add the Argo Helm chart repository
+  kubernetes.core.helm_repository:
+    name: argo
+    repo_url: https://argoproj.github.io/argo-helm
+
+- name: Install or upgrade Argo CD
+  kubernetes.core.helm:
+    name: argocd
+    chart_ref: argo/argo-cd
+    chart_version: "{{ argocd_chart_version }}"
+    release_namespace: "{{ argocd_namespace }}"
+    create_namespace: true
+    context: "{{ kube_context }}"
+    update_repo_cache: true
+    wait: true
+    timeout: 15m0s
+    values: "{{ lookup('ansible.builtin.template', 'values.yaml.j2') | from_yaml }}"
+
+- name: Wait until the Application resource type exists
+  kubernetes.core.k8s_info:
+    context: "{{ kube_context }}"
+    api_version: apiextensions.k8s.io/v1
+    kind: CustomResourceDefinition
+    name: applications.argoproj.io
+  register: argocd_crd
+  until: argocd_crd.resources | length > 0
+  retries: 30
+  delay: 5

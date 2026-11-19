@@ -1,0 +1,88 @@
+# Read-only checks to run before a Kubernetes version upgrade. Changes nothing.
+#
+#   ansible-playbook playbooks/upgrade-precheck.yml --limit ap-southeast-1 -e target_version=1.37
+#
+# The upgrade itself is a Terraform change (kubernetes_version in envs/<region>/20-eks.tfvars).
+# See docs/upgrade-runbook.md.
+- name: Upgrade readiness checks
+  hosts: aws
+  gather_facts: false
+  vars:
+    target_version: "1.37"
+    k: [kubectl, --context, "{{ kube_context }}"]
+
+  tasks:
+    - name: Refuse to run against every cluster by accident
+      ansible.builtin.assert:
+        that: ansible_limit is defined
+        fail_msg: "Choose a cluster: --limit ap-southeast-2 or --limit ap-southeast-1"
+      run_once: true
+
+    - name: Write a kubeconfig entry
+      ansible.builtin.command:
+        argv: [aws, eks, update-kubeconfig, --region, "{{ region }}", --name, "{{ cluster_name }}", --alias, "{{ kube_context }}"]
+      changed_when: false
+
+    - name: Current control plane version
+      ansible.builtin.command:
+        argv: [aws, eks, describe-cluster, --region, "{{ region }}", --name, "{{ cluster_name }}", --query, cluster.version, --output, text]
+      register: current_version
+      changed_when: false
+
+    # You can only move up one minor version at a time: 1.36 -> 1.37, never 1.35 -> 1.37.
+    - name: Check the upgrade is one minor version
+      ansible.builtin.assert:
+        that: (target_version.split('.')[1] | int) - (current_version.stdout.split('.')[1] | int) in [0, 1]
+        fail_msg: "{{ current_version.stdout }} -> {{ target_version }} skips a version. Upgrade one minor version at a time."
+
+    # EKS upgrade insights: AWS scans the audit log for things that will break.
+    - name: EKS upgrade insights
+      ansible.builtin.command:
+        argv: [aws, eks, list-insights, --region, "{{ region }}", --cluster-name, "{{ cluster_name }}", --query, "insights[].{check:name,status:insightStatus.status}", --output, json]
+      register: insights
+      changed_when: false
+
+    # Calls to APIs that a later version removes. Fix the manifests or charts making them.
+    - name: Deprecated API calls seen by the API server
+      ansible.builtin.shell:
+        cmd: "{{ k | join(' ') }} get --raw /metrics | grep '^apiserver_requested_deprecated_apis' | grep -v 'removed_release=\"\"' || true"
+      register: deprecated
+      changed_when: false
+
+    # The kubelet may be older than the control plane, never newer. Nodes are upgraded last.
+    - name: Node versions
+      ansible.builtin.command:
+        argv: "{{ k + ['get', 'nodes', '-o', 'custom-columns=NODE:.metadata.name,KUBELET:.status.nodeInfo.kubeletVersion,POOL:.metadata.labels.karpenter\\.sh/nodepool,GROUP:.metadata.labels.eks\\.amazonaws\\.com/nodegroup'] }}"
+      register: nodes
+      changed_when: false
+
+    # A PodDisruptionBudget that allows zero disruptions blocks a node drain, and so the upgrade.
+    - name: PodDisruptionBudgets
+      ansible.builtin.command:
+        argv: "{{ k + ['get', 'pdb', '-A', '-o', 'json'] }}"
+      register: pdbs
+      changed_when: false
+
+    - name: Add-on versions installed now
+      ansible.builtin.command:
+        argv: [aws, eks, list-addons, --region, "{{ region }}", --cluster-name, "{{ cluster_name }}", --query, addons, --output, json]
+      register: addons
+      changed_when: false
+
+    - name: Default add-on version for the target Kubernetes version
+      ansible.builtin.command:
+        argv: [aws, eks, describe-addon-versions, --region, "{{ region }}", --kubernetes-version, "{{ target_version }}", --addon-name, "{{ item }}", --query, "addons[0].addonVersions[?compatibilities[0].defaultVersion==`true`].addonVersion | [0]", --output, text]
+      loop: "{{ addons.stdout | from_json }}"
+      register: addon_targets
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg:
+          cluster: "{{ cluster_name }}"
+          upgrade: "{{ current_version.stdout }} -> {{ target_version }}"
+          eks_insights: "{{ insights.stdout | from_json }}"
+          deprecated_api_calls: "{{ deprecated.stdout_lines | default([]) or 'none seen' }}"
+          nodes: "{{ nodes.stdout_lines }}"
+          pdbs_blocking_a_drain: "{{ (pdbs.stdout | from_json)['items'] | selectattr('status.disruptionsAllowed', 'equalto', 0) | map(attribute='metadata.name') | list or 'none' }}"
+          addon_versions_after_upgrade: "{{ dict(addon_targets.results | map(attribute='item') | zip(addon_targets.results | map(attribute='stdout'))) }}"

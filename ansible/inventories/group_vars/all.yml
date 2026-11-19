@@ -1,0 +1,12 @@
+# Variables for every cluster.
+
+# The Git repository Argo CD reads: the GitOps repository (charts, cluster settings, and what
+# version each environment runs). Override on the command line or with GITOPS_REPO_URL.
+gitops_repo_url: "{{ lookup('ansible.builtin.env', 'GITOPS_REPO_URL') | default('https://github.com/CHANGE-ME/eks-multiregion-gitops.git', true) }}"
+gitops_repo_revision: main
+
+# Chart versions are pinned, so an upgrade is a reviewed change to this file.
+argocd_chart_version: "10.18.0" # Argo CD v3.6.1
+
+vault_namespace: vault
+vault_pod: vault-0
