@@ -52,7 +52,7 @@ pipeline {
           sh 'scripts/tf.sh apply 10-network "$TARGET"'
           sh 'scripts/tf.sh apply 15-database "$TARGET"'
           sh 'scripts/tf.sh apply 20-eks "$TARGET"'
-          sh 'mkdir -p ansible/.tfout && scripts/tf.sh output 20-eks "$TARGET" > "ansible/.tfout/$TARGET.json"'
+          sh 'scripts/handoff.sh "$TARGET"'
         }
       }
     }

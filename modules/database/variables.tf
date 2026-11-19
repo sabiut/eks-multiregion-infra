@@ -24,7 +24,7 @@ variable "replicate_source_arn" {
 }
 
 variable "fenced" {
-  description = "true removes every ingress rule, so nothing can connect. The write fence used during failover."
+  description = "The write fence used during failover: the database refuses writes, and its security group accepts no new connection."
   type        = bool
   default     = false
 }

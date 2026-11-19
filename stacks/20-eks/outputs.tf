@@ -48,29 +48,3 @@ output "vault_kms_alias" {
 output "kubeconfig_command" {
   value = "aws eks update-kubeconfig --region ${var.region} --name ${module.cluster.cluster_name} --alias ${module.cluster.cluster_name}"
 }
-
-# ---- The database tier, passed through from stack 15-database ----
-
-output "db_host" {
-  value = local.database.db_host
-}
-
-output "db_port" {
-  value = local.database.db_port
-}
-
-output "db_name" {
-  value = local.database.db_name
-}
-
-output "db_role" {
-  value = local.database.db_role
-}
-
-output "db_secret_arn" {
-  value = local.database.db_secret_arn
-}
-
-output "db_secret_region" {
-  value = local.database.db_secret_region
-}

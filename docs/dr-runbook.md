@@ -59,10 +59,18 @@ Terraform plans only. Run it as a drill before relying on it.
    ```
    The visit count rises, served by `ap-southeast-2`.
 
-2. **Fence Sydney's database.** Close it to every client by removing the rules from its
-   security group. This is done at the network layer, outside the cluster, because anything
-   done inside the cluster can be undone: Argo CD's self-heal restores an Application that
-   was paused, and an autoscaler can bring back pods that were scaled to zero.
+2. **Fence Sydney's database**, in two parts. Both are done on the database, outside the
+   cluster, because anything done inside the cluster can be undone: Argo CD's self-heal
+   restores a paused Application, and an autoscaler can bring back pods scaled to zero.
+
+   Part 1 makes the database itself refuse writes. This is the real fence: it applies to
+   sessions that are already connected and to any client, however it reached the database.
+   ```
+   aws rds modify-db-parameter-group --region ap-southeast-2 --db-parameter-group-name lab-ap-southeast-2 \
+        --parameters ParameterName=default_transaction_read_only,ParameterValue=1,ApplyMethod=immediate
+   ```
+   Part 2 stops new connections, by removing the rules from the security group. It is not
+   enough alone: AWS keeps established connections open after a rule is removed.
    ```
    SG=$(aws ec2 describe-security-groups --region ap-southeast-2 \
         --filters Name=group-name,Values=lab-ap-southeast-2-database --query 'SecurityGroups[0].GroupId' --output text)
@@ -71,22 +79,43 @@ Terraform plans only. Run it as a drill before relying on it.
      | xargs -r aws ec2 revoke-security-group-ingress --region ap-southeast-2 --group-id $SG --security-group-rule-ids
    ```
    Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge it, so a
-   later Terraform apply keeps the fence and does not put the rules back.
+   later Terraform apply keeps both parts and does not undo them.
 
-3. **Verify the fence before going on.** The loop from step 1 must now show
-   `"error": "database unavailable or read-only"` on every line, and the security group
-   must have no ingress rules:
+3. **Verify the fence before going on.** All three must hold:
    ```
+   # the parameter is applied (prints "in-sync"; "applying" means wait)
+   aws rds describe-db-instances --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2 \
+        --query 'DBInstances[0].DBParameterGroups[0].ParameterApplyStatus' --output text
+   # no way in for new connections (prints 0)
    aws ec2 describe-security-group-rules --region ap-southeast-2 --filters Name=group-id,Values=$SG \
-        --query 'length(SecurityGroupRules[?!IsEgress])'        # must print 0
+        --query 'length(SecurityGroupRules[?!IsEgress])'
    ```
-   **If Sydney cannot be reached at all** (a real regional outage), the fence cannot be
-   applied or verified now. Carry on, and treat it as owed: it must be applied and verified
-   the moment the region's API answers again, before anything else is done in Sydney. Until
-   then Sydney is not registered with the accelerator (step 6), so users cannot reach it.
-   Writes that had not replicated when Sydney was lost are gone: that is the RPO.
+   and a write sent **straight to Sydney's own load balancer**, not through the
+   accelerator, is refused. Sydney's load balancer is internet-facing, so it stays
+   reachable by its own address whatever the accelerator does:
+   ```
+   SYD=http://$(kubectl --context lab-ap-southeast-2 -n demo get ingress demo-web -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+   curl -s -X POST "$SYD/api/visits" | jq -c .      # must be the "database unavailable or read-only" error
+   ```
 
-4. **Promote Singapore's database**, wait, and protect it:
+4. **If the fence cannot be applied or verified, stop. This is a decision, not a step.**
+   That is the situation in a real regional outage: Sydney's API does not answer, so you
+   cannot fence it, and you cannot know whether it is still taking writes from clients that
+   can reach it.
+
+   | Choice | What you accept |
+   | --- | --- |
+   | Wait for Sydney | A longer outage. No data is lost or split |
+   | Promote Singapore without a fence | Service returns sooner. Writes Sydney had not replicated are lost (the RPO). **And** if Sydney comes back before it is fenced, it will accept writes on its own load balancer address: two diverging databases, which cannot be merged automatically |
+
+   Promoting without a fence needs a named person's decision, recorded with the time. If
+   that is the decision, fencing Sydney (steps 2 and 3) becomes the first action the moment
+   its API answers again, before anything else is touched there, and any writes it took in
+   between have to be found and reconciled by hand. This lab has no automatic protection
+   for this case. Production designs close the gap with a managed failover that fences for
+   you (Aurora Global Database), or by keeping the standby's load balancer private.
+
+5. **Promote Singapore's database**, wait, and protect it:
    ```
    aws rds promote-read-replica --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
    aws rds wait db-instance-available --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
@@ -96,32 +125,53 @@ Terraform plans only. Run it as a drill before relying on it.
    Deletion protection matters from this moment: this instance is now the only current copy
    of the data, and no Terraform run or mistake should be able to delete it.
 
-5. **Verify a write in Singapore before any user is sent there**, from inside the cluster:
+   With no replica left, Sydney's old database can now also be stopped, which closes it
+   completely (AWS starts a stopped instance again after seven days):
+   ```
+   aws rds stop-db-instance --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   ```
+
+6. **Verify a write in Singapore before any user is sent there**, from inside the cluster:
    ```
    kubectl --context lab-ap-southeast-1 -n demo port-forward svc/demo-web 8080:80 &
    curl -s -X POST localhost:8080/api/visits | jq -c .     # must return a count, with "store": "postgres"
    ```
    A page that loads is not proof. nginx answers its health check even when the database
-   refuses writes.
+   refuses writes. The promoted database keeps the password it had as a replica, which the
+   backend already holds, so nothing about credentials changes during the failover.
 
-6. **Move the traffic.** In `envs/global/30-global.tfvars` replace the Sydney entry with
+7. **Move the traffic.** In `envs/global/30-global.tfvars` replace the Sydney entry with
    `"ap-southeast-1" = 100`, then apply target `global`. The loop from step 1 shows counts
    again. The time from step 2 to here is your measured RTO.
 
-7. **Bring Terraform in line with reality.** In `envs/ap-southeast-1/15-database.tfvars` set
-   `primary_region = ""` and `deletion_protection = true`. Plan the database stack for
-   Singapore and read it before applying:
+8. Scale the standby for full load (in the GitOps repository, raise `autoscaling.minReplicas`
+   for Singapore; Cluster Autoscaler adds nodes).
+
+The failover ends here. Singapore is serving, with the credentials it already had.
+
+### Afterwards, in a quiet period: bring Terraform in line
+
+Terraform still describes Singapore as a replica. Correcting that also gives the new primary
+its own master password and its own secret in Singapore, and **changing the password
+interrupts database access** until the backend has the new one (a minute or two). So this is
+a planned change, not part of the emergency.
+
+1. In `envs/ap-southeast-1/15-database.tfvars` set `primary_region = ""` and
+   `deletion_protection = true`. Plan the database stack for Singapore and read it:
 
    - It must say **0 to destroy**, and show `aws_db_instance.this` as *updated in place*.
    - If it shows the instance being destroyed or replaced, **stop and do not apply**.
 
-   The module uses one resource for both roles so that this change is an update, not a
-   delete and re-create. The update gives the new primary its own master password and its
-   own secret in Singapore; run the `vault.yml` playbook for Singapore afterwards so the
-   backend picks them up.
-
-8. Scale the standby for full load (in the GitOps repository, raise `autoscaling.minReplicas`
-   for Singapore; Cluster Autoscaler adds nodes).
+2. Apply it. From this moment the backend's stored password is wrong, so do the next two
+   steps straight away.
+3. Hand the new outputs to Ansible and update Vault. The handoff must be run again here:
+   without it, Ansible would read the old secret's address and write the old password back.
+   ```
+   scripts/handoff.sh ap-southeast-1
+   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-1 --tags config
+   ```
+4. **Verify a write again**, through the front door, once External Secrets has refreshed
+   (up to a minute): the loop from the failover's step 1 must show counts rising.
 
 ### Fail back to Sydney
 
@@ -129,14 +179,15 @@ Do not re-register Sydney or reopen its database. After the promotion Singapore 
 current copy. Sydney's old database is stale and is not a replica of anything.
 
 1. Leave Sydney fenced and out of the accelerator.
-2. Rebuild Sydney's database as a replica of Singapore: in
+2. Rebuild Sydney's database as a replica of Singapore (only after "bring Terraform in
+   line" above is done, so Singapore's stack is the primary in state): in
    `envs/ap-southeast-2/15-database.tfvars` set `primary_region = "ap-southeast-1"` and
    `fenced = false`, then apply. The plan **replaces** Sydney's instance (a primary cannot
    be turned into a replica), which is intended here: the stale copy is the one being
    discarded. Check that the plan touches Sydney's stack only.
 3. Wait for the replica to catch up (`ReplicaLag` in CloudWatch near zero).
 4. Run the failover steps in the other direction, in a quiet period: fence Singapore, verify,
-   promote Sydney, verify a write, move the traffic, bring Terraform in line.
+   promote Sydney, verify a write, move the traffic. Then bring Terraform in line.
 5. Rebuild Singapore as the replica.
 
 Many teams do not fail back at all: the region that took over stays primary, and the other

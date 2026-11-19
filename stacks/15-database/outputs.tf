@@ -1,5 +1,5 @@
-# Read by stack 20-eks, which passes them on to Ansible. Ansible copies the connection
-# details into Vault, and the backend pods read them from there.
+# Handed to Ansible (scripts/handoff.sh), which copies the connection details into Vault.
+# The backend pods read them from there.
 
 output "db_arn" {
   value = module.database.arn

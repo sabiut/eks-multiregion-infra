@@ -74,7 +74,7 @@ jobs:
             else
               echo "Skipped 15-database and 20-eks: apply the network first."
             fi
-            if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$TARGET/15-database.tfstate" >/dev/null 2>&1; then
+            if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "$TARGET/10-network.tfstate" >/dev/null 2>&1; then
               scripts/tf.sh plan 20-eks "$TARGET"
             fi
           fi
@@ -120,9 +120,7 @@ jobs:
       # The handoff: Terraform's outputs become Ansible's variables.
       - name: Hand Terraform outputs to Ansible
         if: inputs.target != 'global'
-        run: |
-          mkdir -p ansible/.tfout
-          scripts/tf.sh output 20-eks "$TARGET" > "ansible/.tfout/$TARGET.json"
+        run: scripts/handoff.sh "$TARGET"
 
       - uses: actions/setup-python@v5
         if: inputs.target != 'global'

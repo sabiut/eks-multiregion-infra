@@ -75,7 +75,7 @@ jobs:
           else
             echo "Skipped 15-database and 20-eks: the network in ${{ matrix.region }} has not been applied yet." | tee -a plan.txt
           fi
-          if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "${{ matrix.region }}/15-database.tfstate" >/dev/null 2>&1; then
+          if aws s3api head-object --bucket "$TF_STATE_BUCKET" --key "${{ matrix.region }}/10-network.tfstate" >/dev/null 2>&1; then
             scripts/tf.sh plan 20-eks ${{ matrix.region }} | tee -a plan.txt
           fi
           { echo "### ${{ matrix.region }}"; echo '```'; grep -E '^(Plan:|No changes|Skipped)' plan.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

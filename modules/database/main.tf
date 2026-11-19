@@ -20,10 +20,10 @@ resource "aws_security_group" "this" {
   tags = { Name = "${var.name}-database" }
 }
 
-# THE WRITE FENCE. With fenced = true there is no rule at all, so nothing can connect to
-# this database: not the backend, not a pod Argo CD or an autoscaler brings back. Used
-# during failover so the old primary cannot take writes after the replica is promoted.
-# Replication to the other region does not pass through this security group.
+# THE WRITE FENCE, part 2 of 2: with fenced = true there is no rule at all, so no NEW
+# connection can be made. This alone is not a fence: AWS keeps already-established
+# connections open after a rule is removed (connection tracking). Part 1, the parameter
+# group below, is what stops writes on connections that are already open.
 resource "aws_vpc_security_group_ingress_rule" "from_backend" {
   for_each = var.fenced ? toset([]) : toset(var.allowed_cidrs)
 
@@ -68,6 +68,23 @@ resource "aws_secretsmanager_secret_version" "master" {
   secret_string_wo_version = var.password_version
 }
 
+# THE WRITE FENCE, part 1 of 2: with fenced = true the database itself refuses writes.
+# default_transaction_read_only makes every transaction read-only, including on sessions
+# that are already connected, and however the client reached the database. Replication to
+# the other region is not a client transaction and carries on, so the replica can still
+# catch up before it is promoted. The parameter is dynamic: no restart.
+resource "aws_db_parameter_group" "this" {
+  name        = var.name
+  family      = "postgres${var.engine_version}"
+  description = "Parameters for ${var.name}, including the write fence"
+
+  parameter {
+    name         = "default_transaction_read_only"
+    value        = var.fenced ? "1" : "0"
+    apply_method = "immediate"
+  }
+}
+
 # One resource for both modes, on purpose. A promoted replica and a primary are the same
 # kind of object, so changing this region from replica to primary must be an update of the
 # instance that is already there. With two separate resources (one for each mode), the same
@@ -94,6 +111,7 @@ resource "aws_db_instance" "this" {
   # Automated backups must be on for the instance to have read replicas.
   backup_retention_period = local.is_replica ? null : 1
 
+  parameter_group_name   = aws_db_parameter_group.this.name
   storage_encrypted      = true
   db_subnet_group_name   = var.subnet_group
   vpc_security_group_ids = [aws_security_group.this.id]
@@ -108,6 +126,16 @@ resource "aws_db_instance" "this" {
   deletion_protection = var.deletion_protection
   skip_final_snapshot = true
   apply_immediately   = true
+}
+
+# For a database created by the first version of this module, which used two resources.
+# A primary moves to the new address by itself. A replica has to be moved by hand BEFORE
+# the first plan, because Terraform allows only one "moved" source per destination:
+#   terraform state mv 'module.database.aws_db_instance.replica[0]' 'module.database.aws_db_instance.this'
+# Either way the upgrade plan must show the instance updated in place and 0 to destroy.
+moved {
+  from = aws_db_instance.primary[0]
+  to   = aws_db_instance.this
 }
 
 data "aws_kms_alias" "rds" {

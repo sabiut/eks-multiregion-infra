@@ -63,8 +63,9 @@ accelerator, so no user reaches it until the replica is promoted and a write is 
 | Argo CD | Every add-on and the application, from Git | Keeps the cluster matching Git continuously, not only when a pipeline runs |
 | GitHub Actions | Runs Terraform and Ansible, with an approval before any change | No one applies from a laptop; every change is reviewed and logged |
 
-The handoff between Terraform and Ansible is one JSON file: after an apply, the pipeline
-writes Terraform's outputs to `ansible/.tfout/<region>.json`, and Ansible's variables read it
+The handoff between Terraform and Ansible is a pair of JSON files: after an apply, the pipeline
+writes Terraform's outputs to JSON files under `ansible/.tfout/` (`scripts/handoff.sh`), and
+Ansible's variables read them
 (`ansible/inventories/group_vars/aws.yml`).
 
 ## Layout

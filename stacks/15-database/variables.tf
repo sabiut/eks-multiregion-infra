@@ -13,7 +13,7 @@ variable "primary_region" {
 }
 
 variable "fenced" {
-  description = "true closes the database to every client. Set on the old primary during a failover (docs/dr-runbook.md)."
+  description = "The write fence: the database refuses writes and accepts no new connection. Set on the old primary during a failover (docs/dr-runbook.md)."
   type        = bool
   default     = false
 }
