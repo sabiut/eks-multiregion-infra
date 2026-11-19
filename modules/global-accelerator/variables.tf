@@ -9,7 +9,7 @@ variable "cluster_name_prefix" {
 }
 
 variable "regions" {
-  description = "Region => traffic dial (0-100): the share of the traffic that would normally reach the region that is let through. A region at 0 receives no traffic. Only a region whose database accepts writes should be above 0."
+  description = "Regions registered with the accelerator => traffic dial (0-100). List only regions whose database accepts writes: on a health failover the accelerator ignores the dial, so a standby must be left out, not set to 0."
   type        = map(number)
 }
 

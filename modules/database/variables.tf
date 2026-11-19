@@ -23,6 +23,18 @@ variable "replicate_source_arn" {
   default     = ""
 }
 
+variable "fenced" {
+  description = "true removes every ingress rule, so nothing can connect. The write fence used during failover."
+  type        = bool
+  default     = false
+}
+
+variable "deletion_protection" {
+  description = "Refuse to delete the instance. Off in the lab, on in production and on a promoted database."
+  type        = bool
+  default     = false
+}
+
 variable "password_version" {
   description = "Raise by one to generate and set a new master password."
   type        = number

@@ -56,8 +56,11 @@ module "publish_role" {
     {
       Effect = "Allow"
       Action = [
-        "ecr:BatchCheckLayerAvailability", "ecr:BatchGetImage", "ecr:CompleteLayerUpload",
+        # push
+        "ecr:BatchCheckLayerAvailability", "ecr:CompleteLayerUpload",
         "ecr:InitiateLayerUpload", "ecr:PutImage", "ecr:UploadLayerPart",
+        # pull: a rerun copies an already-published image to the region that missed it
+        "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
       ]
       Resource = flatten([for m in module.images : m.arns])
     },

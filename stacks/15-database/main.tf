@@ -18,4 +18,6 @@ module "database" {
 
   replicate_source_arn = local.is_replica ? local.primary.db_arn : ""
   multi_az             = var.multi_az
+  fenced               = var.fenced
+  deletion_protection  = var.deletion_protection
 }

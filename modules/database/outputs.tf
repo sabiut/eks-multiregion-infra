@@ -1,14 +1,14 @@
 output "arn" {
   description = "A replica in another region names its source by this."
-  value       = local.instance.arn
+  value       = aws_db_instance.this.arn
 }
 
 output "host" {
-  value = local.instance.address
+  value = aws_db_instance.this.address
 }
 
 output "port" {
-  value = local.instance.port
+  value = aws_db_instance.this.port
 }
 
 output "database_name" {

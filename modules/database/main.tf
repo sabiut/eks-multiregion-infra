@@ -20,8 +20,12 @@ resource "aws_security_group" "this" {
   tags = { Name = "${var.name}-database" }
 }
 
+# THE WRITE FENCE. With fenced = true there is no rule at all, so nothing can connect to
+# this database: not the backend, not a pod Argo CD or an autoscaler brings back. Used
+# during failover so the old primary cannot take writes after the replica is promoted.
+# Replication to the other region does not pass through this security group.
 resource "aws_vpc_security_group_ingress_rule" "from_backend" {
-  for_each = toset(var.allowed_cidrs)
+  for_each = var.fenced ? toset([]) : toset(var.allowed_cidrs)
 
   security_group_id = aws_security_group.this.id
   description       = "PostgreSQL from a backend subnet"
@@ -64,23 +68,33 @@ resource "aws_secretsmanager_secret_version" "master" {
   secret_string_wo_version = var.password_version
 }
 
-resource "aws_db_instance" "primary" {
-  count = local.is_replica ? 0 : 1
-
+# One resource for both modes, on purpose. A promoted replica and a primary are the same
+# kind of object, so changing this region from replica to primary must be an update of the
+# instance that is already there. With two separate resources (one for each mode), the same
+# change would delete the promoted database and create an empty one.
+resource "aws_db_instance" "this" {
   identifier     = var.name
-  engine         = "postgres"
-  engine_version = var.engine_version
   instance_class = var.instance_class
 
-  allocated_storage = 20
-  storage_type      = "gp3"
-  storage_encrypted = true
+  # ---- replica only ----
+  # Removing replicate_source_db from an existing replica promotes it in place.
+  replicate_source_db = local.is_replica ? var.replicate_source_arn : null
+  # A cross-region replica of an encrypted database needs a KMS key in its own region.
+  kms_key_id = local.is_replica ? data.aws_kms_alias.rds[0].target_key_arn : null
 
-  db_name             = var.database_name
-  username            = local.master_username
-  password_wo         = ephemeral.random_password.master[0].result
-  password_wo_version = var.password_version
+  # ---- primary only (a replica copies these from its source) ----
+  engine              = local.is_replica ? null : "postgres"
+  engine_version      = local.is_replica ? null : var.engine_version
+  allocated_storage   = local.is_replica ? null : 20
+  storage_type        = local.is_replica ? null : "gp3"
+  db_name             = local.is_replica ? null : var.database_name
+  username            = local.is_replica ? null : local.master_username
+  password_wo         = local.is_replica ? null : ephemeral.random_password.master[0].result
+  password_wo_version = local.is_replica ? null : var.password_version
+  # Automated backups must be on for the instance to have read replicas.
+  backup_retention_period = local.is_replica ? null : 1
 
+  storage_encrypted      = true
   db_subnet_group_name   = var.subnet_group
   vpc_security_group_ids = [aws_security_group.this.id]
   publicly_accessible    = false
@@ -89,40 +103,14 @@ resource "aws_db_instance" "primary" {
   # takes over by itself when the instance or its AZ fails.
   multi_az = var.multi_az
 
-  # Automated backups must be on for the instance to have read replicas.
-  backup_retention_period = 1
-
-  # LAB PROFILE: easy to delete. Production: deletion_protection = true and a final snapshot.
-  deletion_protection = false
+  # LAB PROFILE: off, and no final snapshot, so the lab is easy to remove. Production: on.
+  # The DR runbook switches it on for a database the moment it is promoted.
+  deletion_protection = var.deletion_protection
   skip_final_snapshot = true
   apply_immediately   = true
 }
 
-# A cross-region replica of an encrypted database needs a KMS key in its own region.
 data "aws_kms_alias" "rds" {
   count = local.is_replica ? 1 : 0
   name  = "alias/aws/rds"
-}
-
-resource "aws_db_instance" "replica" {
-  count = local.is_replica ? 1 : 0
-
-  identifier          = var.name
-  replicate_source_db = var.replicate_source_arn
-  instance_class      = var.instance_class
-
-  storage_encrypted = true
-  kms_key_id        = data.aws_kms_alias.rds[0].target_key_arn
-
-  db_subnet_group_name   = var.subnet_group
-  vpc_security_group_ids = [aws_security_group.this.id]
-  publicly_accessible    = false
-
-  deletion_protection = false
-  skip_final_snapshot = true
-  apply_immediately   = true
-}
-
-locals {
-  instance = local.is_replica ? aws_db_instance.replica[0] : aws_db_instance.primary[0]
 }

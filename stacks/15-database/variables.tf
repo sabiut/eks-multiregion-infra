@@ -12,6 +12,17 @@ variable "primary_region" {
   default     = ""
 }
 
+variable "fenced" {
+  description = "true closes the database to every client. Set on the old primary during a failover (docs/dr-runbook.md)."
+  type        = bool
+  default     = false
+}
+
+variable "deletion_protection" {
+  type    = bool
+  default = false
+}
+
 variable "multi_az" {
   type    = bool
   default = false

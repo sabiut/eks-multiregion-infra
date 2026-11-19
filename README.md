@@ -50,8 +50,8 @@ node's subnet. Sydney gets those nodes from Karpenter (one NodePool per tier), S
 from one managed node group per tier.
 
 Sydney holds the primary database and takes all the traffic. Singapore is a warm standby: it
-runs the application, holds a cross-region read replica, and receives no traffic until the
-replica is promoted and the traffic dials are moved
+runs the application and holds a cross-region read replica, but is not registered with the
+accelerator, so no user reaches it until the replica is promoted and a write is verified
 ([DR runbook](docs/dr-runbook.md)).
 
 ## Who does what
@@ -75,7 +75,7 @@ stacks/                  what gets applied. Each stack has its own state and is 
   10-network/            that calls modules: one region's network, four kinds of subnet
   15-database/           the database tier: RDS primary (Sydney) or read replica (Singapore)
   20-eks/                one cluster and the AWS resources its add-ons need
-  30-global/             Global Accelerator in front of both regions
+  30-global/             Global Accelerator in front of the live region
 modules/                 the reusable Terraform the stacks call (see the table below)
 envs/<region>/*.tfvars   what differs per region (CIDR, version, autoscaler)
 scripts/tf.sh            runs one stack in one region, the same on a laptop and in CI
@@ -147,8 +147,9 @@ Actions > **deploy** > Run workflow:
 | 3 | `global` | `apply` | 3 minutes |
 
 Sydney first: Singapore's database is a replica of Sydney's. Each region runs four steps:
-network, database, cluster, then Ansible. Step 3 needs both load balancers to exist, so wait
-until `demo-web-prd` is healthy in both regions (`kubectl -n argocd get applications`).
+network, database, cluster, then Ansible. Step 3 registers Sydney only and needs its load
+balancer to exist, so wait until `demo-web-prd` is healthy there
+(`kubectl -n argocd get applications`).
 
 ## Remove, in order
 
