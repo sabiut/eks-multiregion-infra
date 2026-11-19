@@ -17,6 +17,12 @@ module "karpenter" {
   iam_role_name                   = "${var.iam_prefix}-karpenter"
   iam_role_use_name_prefix        = false
 
+  # Attach the controller's permissions as an inline policy on its role. As a standalone
+  # managed policy the document is over IAM's 6,144-character limit for managed policies
+  # ("LimitExceeded: Cannot exceed quota for PolicySize"); an inline role policy may be
+  # up to 10,240 characters.
+  enable_inline_policy = true
+
   # Fixed names, so the GitOps repository can refer to them without copying IDs around.
   node_iam_role_name            = "${var.cluster_name}-karpenter-node"
   node_iam_role_use_name_prefix = false
