@@ -59,7 +59,7 @@ Terraform plans only. Run it as a drill before relying on it.
    ```
    The visit count rises, served by `ap-southeast-2`.
 
-2. **Fence Sydney's database**, in two parts. Both are done on the database, outside the
+2. **Fence Sydney's database**, in three parts. All are done on the database, outside the
    cluster, because anything done inside the cluster can be undone: Argo CD's self-heal
    restores a paused Application, and an autoscaler can bring back pods scaled to zero.
 
@@ -78,12 +78,23 @@ Terraform plans only. Run it as a drill before relying on it.
         --query 'SecurityGroupRules[?!IsEgress].SecurityGroupRuleId' --output text \
      | xargs -r aws ec2 revoke-security-group-ingress --region ap-southeast-2 --group-id $SG --security-group-rule-ids
    ```
-   Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge it, so a
-   later Terraform apply keeps both parts and does not undo them.
-
-3. **Verify the fence before going on.** All three must hold:
+   Part 3 ends every session that is already open. The read-only setting only decides how
+   a transaction starts, so a write transaction that was open before part 1 could still
+   commit. Restarting the instance closes every connection and rolls back anything not yet
+   committed. It comes back read-only, with no way in for new connections:
    ```
-   # the parameter is applied (prints "in-sync"; "applying" means wait)
+   aws rds reboot-db-instance --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   aws rds wait db-instance-available --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2
+   ```
+   Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge it, so a
+   later Terraform apply keeps the fence and does not undo it.
+
+3. **Verify the fence before going on.** All four must hold:
+   ```
+   # the instance restarted after the fence was set: this time is later than step 2, part 1
+   aws rds describe-events --region ap-southeast-2 --source-type db-instance --source-identifier lab-ap-southeast-2 \
+        --duration 30 --query "Events[?contains(Message,'restarted')].Date" --output text
+   # the parameter is applied (prints "in-sync"; "applying" or "pending-reboot" means it is not)
    aws rds describe-db-instances --region ap-southeast-2 --db-instance-identifier lab-ap-southeast-2 \
         --query 'DBInstances[0].DBParameterGroups[0].ParameterApplyStatus' --output text
    # no way in for new connections (prints 0)
@@ -115,7 +126,15 @@ Terraform plans only. Run it as a drill before relying on it.
    for this case. Production designs close the gap with a managed failover that fences for
    you (Aurora Global Database), or by keeping the standby's load balancer private.
 
-5. **Promote Singapore's database**, wait, and protect it:
+5. **Let the replica catch up, then promote it.** Nothing can be written in Sydney now, so
+   wait until Singapore has everything that was committed there: `ReplicaLag` for
+   `lab-ap-southeast-1` in CloudWatch reads 0.
+   ```
+   aws cloudwatch get-metric-statistics --region ap-southeast-1 --namespace AWS/RDS --metric-name ReplicaLag \
+        --dimensions Name=DBInstanceIdentifier,Value=lab-ap-southeast-1 --statistics Maximum --period 60 \
+        --start-time "$(date -u -d '-5 min' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" --query 'Datapoints[-1].Maximum'
+   ```
+   Then promote, wait, and protect it:
    ```
    aws rds promote-read-replica --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
    aws rds wait db-instance-available --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
@@ -168,8 +187,10 @@ a planned change, not part of the emergency.
    without it, Ansible would read the old secret's address and write the old password back.
    ```
    scripts/handoff.sh ap-southeast-1
-   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-1 --tags config
+   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-1
    ```
+   Run the whole playbook, not part of it: the step that writes the password needs the
+   Vault token that an earlier step loads. Every step checks before it acts.
 4. **Verify a write again**, through the front door, once External Secrets has refreshed
    (up to a minute): the loop from the failover's step 1 must show counts rising.
 
@@ -186,12 +207,26 @@ current copy. Sydney's old database is stale and is not a replica of anything.
    be turned into a replica), which is intended here: the stale copy is the one being
    discarded. Check that the plan touches Sydney's stack only.
 3. Wait for the replica to catch up (`ReplicaLag` in CloudWatch near zero).
-4. Run the failover steps in the other direction, in a quiet period: fence Singapore, verify,
-   promote Sydney, verify a write, move the traffic. Then bring Terraform in line.
-5. Rebuild Singapore as the replica.
+4. **Give Sydney's backend the current credentials.** The rebuilt replica has Singapore's
+   password, not the one Sydney's Vault still holds from before the failover:
+   ```
+   scripts/handoff.sh ap-southeast-2
+   cd ansible && ansible-playbook playbooks/vault.yml --limit ap-southeast-2
+   ```
+5. **Verify Sydney can read its database before touching Singapore.** If this fails, the
+   reverse cutover would get stuck half way, with Singapore fenced and Sydney unable to serve:
+   ```
+   kubectl --context lab-ap-southeast-2 -n demo port-forward svc/demo-web 8080:80 &
+   curl -s localhost:8080/api/visits | jq -c .     # must return the current count, with "store": "postgres"
+   ```
+6. Run the failover steps in the other direction, in a quiet period: fence Singapore, verify,
+   let Sydney catch up, promote Sydney, verify a write, move the traffic. Then bring
+   Terraform in line.
+7. Rebuild Singapore as the replica, then give its backend the credentials the same way
+   (steps 4 and 5, for `ap-southeast-1`).
 
 Many teams do not fail back at all: the region that took over stays primary, and the other
-becomes the new standby (steps 1 to 3 only).
+becomes the new standby (steps 1 to 5 only).
 
 ## Drill 2: restore a deleted namespace with Velero
 

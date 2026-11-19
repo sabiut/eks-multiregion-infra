@@ -72,7 +72,12 @@ resource "aws_secretsmanager_secret_version" "master" {
 # default_transaction_read_only makes every transaction read-only, including on sessions
 # that are already connected, and however the client reached the database. Replication to
 # the other region is not a client transaction and carries on, so the replica can still
-# catch up before it is promoted. The parameter is dynamic: no restart.
+# catch up before it is promoted.
+#
+# Two limits, both handled in docs/dr-runbook.md. It is a default: it sets the mode a
+# transaction STARTS in, so a transaction that was already open keeps writing until it
+# ends. That is why the runbook restarts the instance after setting it, which ends every
+# session. And a client could override it for its own session; this application never does.
 resource "aws_db_parameter_group" "this" {
   name        = var.name
   family      = "postgres${var.engine_version}"

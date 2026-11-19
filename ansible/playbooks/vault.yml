@@ -17,8 +17,8 @@
         fail_msg: "Choose a cluster: --limit ap-southeast-2, --limit ap-southeast-1 or --limit local"
       run_once: true
 
+  # Always run both roles. The second needs the root token that the first one loads, and
+  # every task checks before it acts, so running the whole playbook again is safe.
   roles:
     - role: vault_init
-      tags: [init]
     - role: vault_config
-      tags: [config]
