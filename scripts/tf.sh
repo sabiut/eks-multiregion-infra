@@ -7,15 +7,19 @@
 #   scripts/tf.sh output  20-eks     ap-southeast-2     # JSON, for Ansible
 #   scripts/tf.sh destroy 20-eks     ap-southeast-2
 #   scripts/tf.sh plan    30-global  global
+#   scripts/tf.sh import  30-global  global '<resource address>' <id>   # adopt something made by hand
 #   PLAN_ONLY=1 scripts/tf.sh plan 20-eks ap-southeast-1   # before anything exists
 #
 # PLAN_ONLY=1 uses throwaway local state and placeholder inputs. It can only plan.
 set -euo pipefail
 
-action=${1:?usage: tf.sh <plan|apply|destroy|output> <stack> <region|global>}
+action=${1:?usage: tf.sh <plan|apply|destroy|output|import> <stack> <region|global>}
 stack=${2:?stack: 10-network, 15-database, 20-eks or 30-global}
 region=${3:?region, or "global" for 30-global}
 plan_only=${PLAN_ONLY:-0}
+if [[ $action == import ]]; then
+  : "${4:?import needs a resource address}" "${5:?import needs the resource ID}"
+fi
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 dir=$root/stacks/$stack
@@ -59,5 +63,6 @@ case $action in
   destroy) [[ ${CI:-} == true ]] && args+=(-auto-approve)
            terraform destroy -input=false "${args[@]}" ;;
   output)  terraform output -json ;;
+  import)  terraform import -input=false "${args[@]}" "${4:?import needs a resource address}" "${5:?import needs the resource ID}" ;;
   *)       echo "unknown action: $action" >&2; exit 1 ;;
 esac

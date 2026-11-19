@@ -9,7 +9,8 @@
 #
 #   - the read-only setting refuses new writes, but a transaction that was already open
 #     still commits, which is why the fence restarts the database
-#   - after the restart nothing can be written
+#   - a write transaction that is open across the restart is rolled back
+#   - after the restart the database refuses writes
 #   - the replica is known to have everything once it has replayed past the primary's
 #     final WAL position
 #   - the promoted replica accepts writes and the old primary still refuses them
@@ -76,8 +77,14 @@ else
 fi
 
 step "Runbook step 2, part 2: restart, which ends every open session"
-sql primary "BEGIN; INSERT INTO visits VALUES ('never committed'); SELECT pg_sleep(30); COMMIT" >/dev/null 2>&1 &
-sleep 2
+# A write transaction that is open, with its INSERT already done, when the restart happens.
+# The setting is on by now, so it has to ask for read-write explicitly to get this far.
+sql primary "BEGIN READ WRITE; INSERT INTO visits VALUES ('never committed'); SELECT pg_sleep(60); COMMIT" >/dev/null 2>&1 &
+open_writer="SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND backend_xid IS NOT NULL AND query LIKE '%never committed%'"
+for _ in $(seq 1 15); do [[ $(sql primary "$open_writer") == 1 ]] && break; sleep 1; done
+[[ $(sql primary "$open_writer") == 1 ]] || die "the test transaction is not open with a write in progress"
+ok "a write transaction is open, its INSERT done and not yet committed"
+ok "(it had to ask for READ WRITE: the setting is a default, not a lock, which is why step 5 closes the door)"
 docker restart "$net-primary" >/dev/null
 wait_for primary
 

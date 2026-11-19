@@ -142,7 +142,14 @@ If Sydney's AWS API or cluster does not answer, go to "If Sydney cannot be reach
    ```
    This stops new connections only; AWS can keep an established connection open after its
    rule is removed. That is harmless here, because step 2 already made every session
-   read-only. Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge
+   read-only.
+
+   One limit to know: the setting is a default, not a lock. A client that explicitly asks
+   for a read-write transaction can still write between step 2 and this step. This
+   application never does (`scripts/drill-local.sh` shows what it takes), and from this
+   step on no client can connect at all.
+
+   Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge
    it, so a later Terraform apply keeps the fence (the setting and the closed door) and does
    not undo it.
 
@@ -221,10 +228,21 @@ If the decision is to promote:
 4. **The fence is now owed.** The moment Sydney's API answers again, and before anything
    else is touched there, apply and verify it (steps 2, 3 and 5 above). Any writes Sydney
    took in between have to be found and reconciled by hand.
-5. When Terraform can reach its state again, make it match what the CLI did: change
-   `envs/global/30-global.tfvars` as in step 9, import the new endpoint group
-   (`terraform import 'module.front_door.aws_globalaccelerator_endpoint_group.region["ap-southeast-1"]' <its ARN>`),
-   and read the plan before applying. It should have nothing left to create.
+5. When Terraform can reach its state again, make it match what the CLI did, in this order:
+
+   - Change `envs/global/30-global.tfvars` as in step 9 (Singapore in, Sydney out). The
+     import below needs this first: the address it names only exists once Singapore is in
+     that file.
+   - Adopt the endpoint group the CLI created. `tf.sh` connects to the right state and
+     passes the variables file; a bare `terraform import` would do neither:
+     ```
+     NEW=$(aws globalaccelerator list-endpoint-groups --region us-west-2 --listener-arn $LIS \
+          --query "EndpointGroups[?EndpointGroupRegion=='ap-southeast-1'].EndpointGroupArn" --output text)
+     scripts/tf.sh import 30-global global 'module.front_door.aws_globalaccelerator_endpoint_group.region["ap-southeast-1"]' "$NEW"
+     ```
+   - Plan and read it before applying: `scripts/tf.sh plan 30-global global`. It should
+     create nothing. Sydney's endpoint group, which the CLI deleted, simply drops out of
+     the state.
 
 ### Afterwards, in a quiet period: bring Terraform in line
 
