@@ -99,6 +99,15 @@ ok "a write is refused"
 ok "the transaction that was open across the restart was rolled back"
 
 step "Runbook step 4: the primary's final position, and the replica catching up to it"
+# The runbook's check for sessions that are writing or holding a transaction open.
+writers="SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() AND (backend_xid IS NOT NULL OR state LIKE 'idle in transaction%')"
+[[ $(sql primary "$writers") == 0 ]] || die "a session is still writing"
+ok "no session is writing or holding a transaction open"
+# The limit the runbook states: a client that explicitly asks for read-write can still
+# write. This is why the fence is only complete when no client does that.
+sql primary "BEGIN READ WRITE; INSERT INTO visits VALUES ('explicit override'); COMMIT" >/dev/null \
+  || die "expected an explicit read-write transaction to succeed"
+ok "(limit, shown on purpose: an explicit BEGIN READ WRITE still commits. The demo backend never does this)"
 lsn=$(sql primary "SELECT pg_current_wal_lsn()")
 [[ $lsn =~ ^[0-9A-F]+/[0-9A-F]+$ ]] || die "not a WAL position: $lsn"
 for _ in $(seq 1 30); do

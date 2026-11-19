@@ -77,7 +77,9 @@ resource "aws_secretsmanager_secret_version" "master" {
 # Two limits, both handled in docs/dr-runbook.md. It is a default: it sets the mode a
 # transaction STARTS in, so a transaction that was already open keeps writing until it
 # ends. That is why the runbook restarts the instance after setting it, which ends every
-# session. And a client could override it for its own session; this application never does.
+# session. And a client can override it by asking for a read-write transaction explicitly.
+# The demo backend never does, and is the only client, so the fence is complete for this
+# lab. It is not a guarantee for a database with other clients.
 resource "aws_db_parameter_group" "this" {
   name        = var.name
   family      = "postgres${var.engine_version}"

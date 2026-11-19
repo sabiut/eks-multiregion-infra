@@ -47,6 +47,10 @@ Failover is manual and ordered on purpose. Two rules decide the order:
 - Users must never be sent to a region whose database cannot take writes.
 - Two databases must never accept writes at the same time (split brain).
 
+**Scope.** The write fence in this procedure is complete for this lab, where the demo backend
+is the only database client and never overrides a read-only default. It is not a general
+guarantee for a database with other clients. Step 4 says exactly where the limit is.
+
 ### What has been tested, and what has not
 
 | Part | Status |
@@ -122,12 +126,35 @@ If Sydney's AWS API or cluster does not answer, go to "If Sydney cannot be reach
    the database, so it also covers Sydney's own load balancer address, which stays
    reachable from the internet whatever the accelerator does.
 
-4. **Record the primary's final position.** No client can write now, so everything that was
-   ever committed is at or before this point in the write-ahead log:
+4. **Record the primary's final position**, after checking nothing else is writing.
+
+   **What this step assumes.** The fence is a default, not a lock: it stops any client that
+   does not explicitly ask for a read-write transaction. The demo backend never asks, and it
+   is the only client of this database, so for this lab the fence is complete. It is **not**
+   a guarantee against other clients. A migration tool, an admin session or another service
+   that starts a transaction with `BEGIN READ WRITE` could still commit after the position
+   below is recorded, and that commit could be missing from the promoted database.
+
+   So first look for any session that is writing or holding a transaction open. This must
+   print `0`:
+   ```
+   scripts/db-psql.sh ap-southeast-2 "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid() AND (backend_xid IS NOT NULL OR state LIKE 'idle in transaction%')"
+   ```
+   If it is not 0, find out what the session is and end it
+   (`SELECT pg_terminate_backend(pid)`) before going on. This is a check at one moment, not
+   a lock: it shows nothing is writing now, it cannot stop a new session a second later.
+
+   Then record the position. Everything this application ever committed is at or before it:
    ```
    FINAL_LSN=$(scripts/db-psql.sh ap-southeast-2 "SELECT pg_current_wal_lsn()")
    echo "$FINAL_LSN"       # looks like 0/30270A8
    ```
+   Go straight on to step 5: the shorter the gap between this step and the closed door, the
+   less room for the case described above.
+
+   A system with more than one kind of database client needs more than this lab has: each
+   client on its own database role, so the roles can be locked (`ALTER ROLE ... NOLOGIN`)
+   and their sessions ended before the position is read, leaving one operator role to read it.
 
 5. **Close the door.** Remove the rules from the database's security group, so nothing can
    connect at all. (This comes after step 4, because step 4 needs to connect.)
@@ -144,10 +171,10 @@ If Sydney's AWS API or cluster does not answer, go to "If Sydney cannot be reach
    rule is removed. That is harmless here, because step 2 already made every session
    read-only.
 
-   One limit to know: the setting is a default, not a lock. A client that explicitly asks
-   for a read-write transaction can still write between step 2 and this step. This
-   application never does (`scripts/drill-local.sh` shows what it takes), and from this
-   step on no client can connect at all.
+   From here no new connection can be made. Together with step 2's restart, which ended
+   the sessions that existed then, that leaves only a connection opened between step 2 and
+   now, and such a connection writes only if its client explicitly asks for read-write (see
+   the assumption in step 4).
 
    Then set `fenced = true` in `envs/ap-southeast-2/15-database.tfvars` and merge
    it, so a later Terraform apply keeps the fence (the setting and the closed door) and does
