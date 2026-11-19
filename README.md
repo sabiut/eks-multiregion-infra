@@ -121,7 +121,8 @@ cannot damage the other.
 
    ```
    cd bootstrap
-   cp terraform.tfvars.example terraform.tfvars    # set your repository names
+   cp terraform.tfvars.example terraform.tfvars    # set your repository names and their
+                                                   # OIDC subject prefixes (see the file)
    terraform init && terraform apply
    terraform output github_secrets
    ```

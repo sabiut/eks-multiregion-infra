@@ -10,6 +10,12 @@ data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
 
+locals {
+  # What each repository's tokens start with (see the note in variables.tf).
+  infra_sub = var.infra_sub_prefix != "" ? var.infra_sub_prefix : "repo:${var.infra_repo}"
+  apps_sub  = var.apps_sub_prefix != "" ? var.apps_sub_prefix : "repo:${var.apps_repo}"
+}
+
 # plan: pull requests and main may plan. Read everything, write only Terraform lock files.
 module "plan_role" {
   source = "../modules/github-oidc-role"
@@ -17,8 +23,8 @@ module "plan_role" {
   name              = "eks-multiregion-plan"
   oidc_provider_arn = data.aws_iam_openid_connect_provider.github.arn
   subjects = [
-    "repo:${var.infra_repo}:pull_request",
-    "repo:${var.infra_repo}:ref:refs/heads/main",
+    "${local.infra_sub}:pull_request",
+    "${local.infra_sub}:ref:refs/heads/main",
   ]
 
   managed_policy_arns = ["arn:aws:iam::aws:policy/ReadOnlyAccess"]
@@ -37,7 +43,7 @@ module "apply_role" {
 
   name              = "eks-multiregion-apply"
   oidc_provider_arn = data.aws_iam_openid_connect_provider.github.arn
-  subjects          = ["repo:${var.infra_repo}:environment:production"]
+  subjects          = ["${local.infra_sub}:environment:production"]
 
   managed_policy_arns = ["arn:aws:iam::aws:policy/AdministratorAccess"]
 }
@@ -49,7 +55,7 @@ module "publish_role" {
 
   name              = "eks-multiregion-publish"
   oidc_provider_arn = data.aws_iam_openid_connect_provider.github.arn
-  subjects          = ["repo:${var.apps_repo}:ref:refs/heads/main"]
+  subjects          = ["${local.apps_sub}:ref:refs/heads/main"]
 
   inline_policy = [
     { Effect = "Allow", Action = "ecr:GetAuthorizationToken", Resource = "*" },

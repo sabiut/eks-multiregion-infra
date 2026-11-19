@@ -1,3 +1,10 @@
 # Copy to terraform.tfvars (ignored by Git) and set your own repositories.
 infra_repo = "your-github-user/eks-multiregion-infra"
 apps_repo  = "your-github-user/eks-multiregion-apps"
+
+# The OIDC subject prefix GitHub sends for each repository. Needed for repositories that
+# use immutable subjects (new repositories do), otherwise every sign-in is refused with
+# "Not authorized to perform sts:AssumeRoleWithWebIdentity". Get each one with:
+#   gh api repos/<owner>/<name>/actions/oidc/customization/sub --jq .sub_claim_prefix
+infra_sub_prefix = "repo:your-github-user@000000/eks-multiregion-infra@000000000"
+apps_sub_prefix  = "repo:your-github-user@000000/eks-multiregion-apps@000000000"
