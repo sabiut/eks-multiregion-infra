@@ -41,6 +41,10 @@ module "vpc" {
   # Frontend and backend are both "private" subnets: no way in from the internet, a NAT
   # gateway for the way out (image pulls, AWS APIs). Frontend first, then backend.
   private_subnets = concat(local.frontend_cidrs, local.backend_cidrs)
+  # The names matter: Karpenter's EC2NodeClass for a tier finds that tier's subnets by
+  # name ("<name>-frontend-*"), so frontend nodes can only start in frontend subnets.
+  # (A separate aws_ec2_tag resource must not be used for this: the VPC module owns the
+  # subnets' tags and removes any tag it did not set, on the next apply.)
   private_subnet_names = concat(
     [for az in local.azs : "${var.name}-frontend-${az}"],
     [for az in local.azs : "${var.name}-backend-${az}"],
@@ -73,17 +77,4 @@ module "vpc" {
 locals {
   frontend_subnet_ids = slice(module.vpc.private_subnets, 0, 3)
   backend_subnet_ids  = slice(module.vpc.private_subnets, 3, 6)
-}
-
-# Mark each private subnet with its tier. Karpenter's EC2NodeClass for a tier selects its
-# subnets by this tag, so frontend nodes can only start in frontend subnets.
-resource "aws_ec2_tag" "tier" {
-  for_each = merge(
-    { for i in range(3) : "frontend-${i}" => { subnet = local.frontend_subnet_ids[i], tier = "frontend" } },
-    { for i in range(3) : "backend-${i}" => { subnet = local.backend_subnet_ids[i], tier = "backend" } },
-  )
-
-  resource_id = each.value.subnet
-  key         = "tier"
-  value       = each.value.tier
 }
