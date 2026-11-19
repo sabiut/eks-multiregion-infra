@@ -17,7 +17,7 @@ output "database_name" {
 
 output "master_secret_arn" {
   description = "Secrets Manager secret holding the master username and password. Empty for a replica: it uses its source's credentials."
-  value       = local.is_replica ? "" : aws_db_instance.primary[0].master_user_secret[0].secret_arn
+  value       = local.is_replica ? "" : aws_secretsmanager_secret.master[0].arn
 }
 
 output "role" {

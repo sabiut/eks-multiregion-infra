@@ -22,7 +22,7 @@
 | An availability zone | Pods are spread across three zones (topology spread). The load balancer stops using the lost zone |
 | A whole cluster's configuration | Git. Run the deploy workflow: Terraform rebuilds the cluster, Ansible installs Argo CD, Argo CD reinstalls everything |
 | Kubernetes objects that are not in Git, or a namespace deleted by mistake | Velero: scheduled backups to S3, restored with one command |
-| A region | The second region is already running. Global Accelerator moves traffic to it |
+| A region | The second region is already running. Promote its database, then move the traffic dials to it |
 | Container images | Each region has its own ECR repository holding the same tags |
 | Vault's unseal ability | The KMS key (auto-unseal). The recovery keys are in Secrets Manager |
 
@@ -38,35 +38,66 @@ would use Raft storage with snapshots copied to the other region, or its own rep
 
 ## Drill 1: region failover
 
-Both regions are running and `global` is applied.
+Both regions are running and `global` is applied. Sydney's traffic dial is 100 and
+Singapore's is 0: the standby runs, but users are not sent to it, because its database is
+read-only.
 
-1. Find the front door and watch which region answers:
+Failover is manual and ordered on purpose. The database decides the order: traffic must
+never reach a region whose database cannot take writes, and two regions must never accept
+writes at the same time.
+
+### Fail over to Singapore
+
+1. Watch the front door:
    ```
    URL=$(terraform -chdir=stacks/30-global output -raw url)
-   while true; do curl -s "$URL/api/info" | jq -r '"\(.region)  \(.version)  \(.pod)"'; sleep 2; done
+   while true; do curl -s -X POST "$URL/api/visits" | jq -c .; curl -s "$URL/api/info" | jq -r '"\(.region)  \(.version)"'; sleep 2; done
    ```
-   From Australia every line says `ap-southeast-2`: the accelerator sends you to the nearest
-   healthy region.
-2. Break Sydney. Either take it out on purpose, by changing `"ap-southeast-2"` to `0` in
-   `envs/global/30-global.tfvars` and applying target `global`, or simulate a failure by
-   making every pod there unready:
+   Every line says `ap-southeast-2`, and the visit count rises.
+2. **Fence Sydney's writes.** If Sydney is still reachable, stop its backend so nothing more
+   is written there after the replica is cut loose:
    ```
-   kubectl --context lab-ap-southeast-2 -n argocd patch application demo-web-prd --type merge -p '{"spec":{"syncPolicy":null}}'
-   kubectl --context lab-ap-southeast-2 -n demo scale deployment demo-web --replicas 0
+   kubectl --context lab-ap-southeast-2 -n argocd patch application demo-api-prd --type merge -p '{"spec":{"syncPolicy":null}}'
+   kubectl --context lab-ap-southeast-2 -n demo scale rollout demo-api --replicas 0
    ```
-3. Watch the loop. Within about a minute the lines say `ap-southeast-1`. The time between
-   the last Sydney line and the first Singapore line is your measured RTO.
-4. Make the database writable in Singapore. Until this step, reads work there and "Record a
-   visit" fails, because a replica is read-only:
+   In a real outage Sydney is already gone and this step is skipped. That is the case where
+   writes not yet replicated are lost: the RPO.
+3. **Promote Singapore's database** and wait until it is available:
    ```
    aws rds promote-read-replica --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
+   aws rds wait db-instance-available --region ap-southeast-1 --db-instance-identifier lab-ap-southeast-1
    ```
-   Terraform still describes it as a replica, so after a real promotion you would update
-   `envs/ap-southeast-1/15-database.tfvars` to make Singapore the primary. In a drill, skip
-   this step, or destroy and re-apply Singapore's database afterwards.
-5. Scale the standby for full load (in the GitOps repository, raise `autoscaling.minReplicas`
+4. **Move the traffic.** In `envs/global/30-global.tfvars` set `"ap-southeast-1" = 100` and
+   `"ap-southeast-2" = 0`, then apply target `global`.
+5. **Verify a write, not just a page.** The loop from step 1 now says `ap-southeast-1` and
+   the visit count rises again. A frontend that answers is not proof: nginx answers its
+   health check even when the database refuses writes. The time from step 2 to the first
+   successful write here is your measured RTO.
+6. Scale the standby for full load (in the GitOps repository, raise `autoscaling.minReplicas`
    for Singapore; Cluster Autoscaler adds nodes).
-6. Fail back: undo step 2 (re-enable sync in Argo CD, or set the dial back to 100).
+
+### Fail back to Sydney
+
+Do not simply turn Sydney's dial back up. After the promotion Singapore is the only current
+copy. Sydney's old database is stale, it is not a replica of anything, and sending users to
+it would show old data and create a second, diverging set of writes (split brain).
+
+1. Keep Sydney's dial at 0 and its backend scaled to zero.
+2. Rebuild Sydney's database from Singapore: destroy the old Sydney instance, then create it
+   again as a read replica of Singapore (swap the roles in the two `15-database.tfvars`
+   files: Singapore's `primary_region` becomes empty, Sydney's becomes `ap-southeast-1`).
+   Changing an existing instance from primary to replica is a replacement, so read the plan.
+3. Wait for the replica to catch up (`ReplicaLag` in CloudWatch near zero).
+4. Repeat the failover steps in the other direction, in a quiet period: fence Singapore's
+   writes, promote Sydney, move the dials, verify a write.
+5. Re-create Singapore as the replica.
+
+Many teams do not fail back at all: the region that took over stays primary, and the other
+becomes the new standby (steps 2 and 3 only).
+
+Terraform note: after `promote-read-replica`, Terraform still describes Singapore as a
+replica. The role swap in step 2 is what brings the code back in line. In a drill you can
+instead destroy and re-apply Singapore's database stack to get the replica back.
 
 ## Drill 2: restore a deleted namespace with Velero
 

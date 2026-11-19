@@ -162,9 +162,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     steps:
+      # The typed value reaches the script as an environment variable, never as script text,
+      # so nothing typed into the form can be run as a command.
       - name: Check the confirmation
+        env:
+          CONFIRM: ${{ inputs.confirm_destroy }}
         run: |
-          [ "${{ inputs.confirm_destroy }}" = "$TARGET" ] || { echo "Type \"$TARGET\" in confirm_destroy to destroy it."; exit 1; }
+          [ "$CONFIRM" = "$TARGET" ] || { echo "Type \"$TARGET\" in confirm_destroy to destroy it."; exit 1; }
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
         with:

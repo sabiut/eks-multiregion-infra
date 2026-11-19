@@ -23,6 +23,12 @@ variable "replicate_source_arn" {
   default     = ""
 }
 
+variable "password_version" {
+  description = "Raise by one to generate and set a new master password."
+  type        = number
+  default     = 1
+}
+
 variable "database_name" {
   type    = string
   default = "demo"

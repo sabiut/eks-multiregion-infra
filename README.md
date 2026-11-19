@@ -22,7 +22,7 @@ applies what it finds.
 ```
                          internet
                             |
-                    Global Accelerator            (nearest healthy region)
+                    Global Accelerator            (Sydney; Singapore after a failover)
                             |
  +--------------------------|----------------------------------------- VPC, one per region --+
  |  public subnets     [ load balancer ]   [ NAT gateway ]                                   |
@@ -49,8 +49,9 @@ workload has a matching `nodeSelector`, and the VPC CNI gives a pod an address f
 node's subnet. Sydney gets those nodes from Karpenter (one NodePool per tier), Singapore
 from one managed node group per tier.
 
-Sydney holds the primary database. Singapore holds a cross-region read replica, so the
-backend there can read but not write until the replica is promoted
+Sydney holds the primary database and takes all the traffic. Singapore is a warm standby: it
+runs the application, holds a cross-region read replica, and receives no traffic until the
+replica is promoted and the traffic dials are moved
 ([DR runbook](docs/dr-runbook.md)).
 
 ## Who does what

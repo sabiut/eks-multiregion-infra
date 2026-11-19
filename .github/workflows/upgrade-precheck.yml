@@ -39,10 +39,15 @@ jobs:
         with:
           python-version: "3.12"
       - name: Report
+        # Inputs reach the script as environment variables, never as script text.
+        env:
+          REGION: ${{ inputs.region }}
+          TARGET_VERSION: ${{ inputs.target_version }}
         run: |
+          [[ $TARGET_VERSION =~ ^[0-9]+\.[0-9]+$ ]] || { echo "target_version must look like 1.37"; exit 1; }
           mkdir -p ansible/.tfout
-          scripts/tf.sh output 20-eks "${{ inputs.region }}" > "ansible/.tfout/${{ inputs.region }}.json"
+          scripts/tf.sh output 20-eks "$REGION" > "ansible/.tfout/$REGION.json"
           cd ansible
           pip install --quiet ansible-core -r requirements.txt
           ansible-galaxy collection install -r requirements.yml
-          ansible-playbook playbooks/upgrade-precheck.yml --limit "${{ inputs.region }}" -e "target_version=${{ inputs.target_version }}"
+          ansible-playbook playbooks/upgrade-precheck.yml --limit "$REGION" -e "target_version=$TARGET_VERSION"

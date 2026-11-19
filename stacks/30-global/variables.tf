@@ -3,7 +3,7 @@ variable "environment" {
 }
 
 variable "regions" {
-  description = "Region => traffic dial (0-100): the share of the traffic that would normally reach the region that is let through. With every region at 100, each user goes to the nearest healthy region."
+  description = "Region => traffic dial (0-100): the share of the traffic that would normally reach the region that is let through. A region at 0 receives no traffic. Only a region whose database accepts writes should be above 0."
   type        = map(number)
 }
 

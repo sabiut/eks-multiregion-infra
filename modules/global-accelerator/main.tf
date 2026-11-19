@@ -5,9 +5,9 @@
 # finds them by the tags the controller puts on them.
 #
 # Global Accelerator gives two static IP addresses and one DNS name. Traffic enters the AWS
-# network at the nearest edge location and goes to a healthy region. If a region's load
-# balancer has no healthy targets, traffic moves to the other region within about a minute,
-# with no DNS change for clients to wait on. Route 53 failover records do the same job with
+# network at the nearest edge location and goes to the regions whose traffic dial is above
+# zero. Moving traffic to the other region is a change of the dials: it takes effect in
+# seconds, with no DNS change for clients to wait on. Route 53 failover records do the same job with
 # DNS (and need a domain), which is the more common choice when you own one.
 
 data "aws_lb" "ingress" {
@@ -41,8 +41,8 @@ resource "aws_globalaccelerator_endpoint_group" "region" {
   listener_arn          = aws_globalaccelerator_listener.http.arn
   endpoint_group_region = each.key
 
-  # The traffic dial. Set a region to 0 to take it out of service on purpose: that is the
-  # failover drill in docs/dr-runbook.md.
+  # The traffic dial. The standby region stays at 0 until its database has been promoted;
+  # see the failover drill in docs/dr-runbook.md.
   traffic_dial_percentage = each.value
 
   # For a load balancer endpoint, health comes from the load balancer's own target health,

@@ -1,8 +1,12 @@
 # The database tier: PostgreSQL on RDS, in the database subnets.
 #
 # Two modes:
-#   primary   a new database. AWS generates the master password and keeps it in Secrets
-#             Manager (manage_master_user_password), so it is never in Terraform state or Git.
+#   primary   a new database. Terraform generates the master password and puts it in
+#             Secrets Manager. The password is "ephemeral" and passed through write-only
+#             arguments, so it is never stored in Terraform state, in a plan or in Git.
+#             (RDS can manage the password itself, manage_master_user_password, but AWS does
+#             not allow a read replica of an instance that uses it. See "Limitations" under
+#             "Password management with Amazon RDS and AWS Secrets Manager".)
 #   replica   a read-only copy of a primary in another region, kept up to date by RDS. In a
 #             disaster it is promoted to a standalone, writable database (docs/dr-runbook.md).
 
@@ -28,7 +32,36 @@ resource "aws_vpc_security_group_ingress_rule" "from_backend" {
 }
 
 locals {
-  is_replica = var.replicate_source_arn != ""
+  is_replica      = var.replicate_source_arn != ""
+  master_username = "dbadmin"
+}
+
+# Generated fresh in memory on every run and never saved. It is only sent to AWS when
+# password_version changes, so raising that number rotates the password.
+ephemeral "random_password" "master" {
+  count   = local.is_replica ? 0 : 1
+  length  = 32
+  special = false
+}
+
+resource "aws_secretsmanager_secret" "master" {
+  count = local.is_replica ? 0 : 1
+
+  name        = "${var.name}/database-master"
+  description = "Master credentials for the ${var.name} database"
+  # LAB PROFILE: delete at once, so the name can be reused after a destroy. Production: 7 to 30.
+  recovery_window_in_days = 0
+}
+
+resource "aws_secretsmanager_secret_version" "master" {
+  count = local.is_replica ? 0 : 1
+
+  secret_id = aws_secretsmanager_secret.master[0].id
+  secret_string_wo = jsonencode({
+    username = local.master_username
+    password = ephemeral.random_password.master[0].result
+  })
+  secret_string_wo_version = var.password_version
 }
 
 resource "aws_db_instance" "primary" {
@@ -43,9 +76,10 @@ resource "aws_db_instance" "primary" {
   storage_type      = "gp3"
   storage_encrypted = true
 
-  db_name                     = var.database_name
-  username                    = "dbadmin"
-  manage_master_user_password = true
+  db_name             = var.database_name
+  username            = local.master_username
+  password_wo         = ephemeral.random_password.master[0].result
+  password_wo_version = var.password_version
 
   db_subnet_group_name   = var.subnet_group
   vpc_security_group_ids = [aws_security_group.this.id]
